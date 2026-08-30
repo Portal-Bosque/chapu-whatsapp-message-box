@@ -1,4 +1,4 @@
-# Chapu Message Box
+# Chapu WhatsApp Message Box
 
 Prototipo artesanal de una caja de mensajes de voz sin pantalla. Un ESP32-S3
 controla un speakerphone USB EMEET y botones arcade; una aplicación Next.js
