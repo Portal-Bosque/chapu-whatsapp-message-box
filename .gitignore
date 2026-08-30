@@ -33,6 +33,30 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# local voice recordings
+/data/recordings/*.wav
+!/data/recordings/.gitkeep
+/data/outbox/**/*.wav
+!/data/outbox/**/.gitkeep
+/data/device/*.json
+!/data/device/.gitkeep
+/data/settings.json
+/data/wacli/
+/data/whatsapp-temp/
+/data/events.jsonl
+/data/whatsapp-incoming/
+/data/recordings/*.json
+
+# ESP32 local build and device credentials
+/firmware/esp32/.pio/
+/firmware/esp32/build/
+/firmware/esp32/managed_components/
+/firmware/esp32/dependencies.lock
+/firmware/esp32/sdkconfig
+/firmware/esp32/sdkconfig.*
+!/firmware/esp32/sdkconfig.defaults
+/firmware/esp32/main/wifi_secrets.h
+
 # vercel
 .vercel
 

@@ -1,36 +1,48 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Chapu Message Box
 
-## Getting Started
+Prototipo artesanal de una caja de mensajes de voz sin pantalla. Un ESP32-S3
+controla un speakerphone USB EMEET y botones arcade; una aplicación Next.js
+recibe y entrega los audios y usa `wacli` como puente local con WhatsApp.
 
-First, run the development server:
+## Qué incluye
+
+- Panel web que replica los controles físicos de Chapu.
+- Grabación desde el navegador y desde el EMEET.
+- Cola de mensajes entrantes con indicador de mensajes pendientes.
+- Envío y recepción de notas de voz mediante `wacli`.
+- Agenda editable y números ocultos en la interfaz.
+- Estado del ESP32, parlante y micrófono USB.
+- Firmware reproducible en `firmware/esp32`.
+
+## Aplicación web
+
+Requiere Node.js y `wacli` instalado en la Mac.
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+La interfaz queda disponible en `http://localhost:3000` y en la red local de la
+Mac. El primer inicio crea los archivos de datos locales dentro de `data/`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Firmware
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Las instrucciones de configuración, compilación y carga están en
+[`firmware/esp32/README.md`](firmware/esp32/README.md). Las credenciales Wi-Fi
+se guardan únicamente en `firmware/esp32/main/wifi_secrets.h`, que Git ignora.
 
-## Learn More
+## Datos privados
 
-To learn more about Next.js, take a look at the following resources:
+El repositorio no incluye sesiones de WhatsApp, audios, números configurados,
+credenciales Wi-Fi ni direcciones locales. Estos datos permanecen en `data/` y
+en el archivo local de secretos del firmware.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## API principal
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `POST /api/recordings`: recibe audio WAV del ESP32.
+- `GET /api/recordings`: lista las grabaciones locales.
+- `GET /api/recordings/:id`: entrega audio con soporte de Range.
+- `GET /api/outbox`: administra la cola destinada al EMEET.
+- `POST /api/device/status`: recibe el heartbeat del ESP32.
+- `/api/whatsapp/*`: autenticación, estado y recepción mediante `wacli`.
