@@ -4,6 +4,14 @@ Prototipo artesanal de una caja de mensajes de voz sin pantalla. Un ESP32-S3
 controla un speakerphone USB EMEET y botones arcade; una aplicación Next.js
 recibe y entrega los audios y usa `wacli` como puente local con WhatsApp.
 
+## Panel de control
+
+![Panel web de Chapu simulando los botones físicos](docs/images/web-panel.jpg)
+
+## Concepto del hardware final
+
+![Concepto de la caja artesanal terminada](docs/images/hardware-concept.png)
+
 ## Qué incluye
 
 - Panel web que replica los controles físicos de Chapu.
