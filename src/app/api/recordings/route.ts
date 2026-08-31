@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { NextResponse } from "next/server";
-import { ensureRecordingsDirectory, isWave, recordingsDirectory, wavDurationMs } from "@/lib/recordings";
+import { analyzeAudioQuality } from "@/lib/audio-quality";
+import { ensureRecordingsDirectory, isWave, readLatestAudioResult, recordingsDirectory, wavDurationMs, writeLatestAudioResult } from "@/lib/recordings";
 import { getSelectedRecipient } from "@/lib/settings";
 import { sendVoiceMessage } from "@/lib/wacli";
 import { appendEvent } from "@/lib/events";
@@ -28,9 +29,36 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Expected a WAV file" }, { status: 415 });
   }
 
-  await ensureRecordingsDirectory();
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const id = `${timestamp}_${randomUUID().slice(0, 8)}`;
+  const quality = analyzeAudioQuality(buffer);
+  const audioResult = {
+    id,
+    processedAt: new Date().toISOString(),
+    discarded: quality.discard,
+    reason: quality.reason,
+    metrics: quality.metrics && {
+      durationMs: quality.metrics.durationMs,
+      rmsDbfs: quality.metrics.rmsDbfs,
+      peakDbfs: quality.metrics.peakDbfs,
+      activeMs: quality.metrics.activeMs,
+      activeRatio: quality.metrics.activeRatio,
+    },
+  };
+  await writeLatestAudioResult(audioResult);
+
+  if (quality.discard) {
+    const metrics = quality.metrics;
+    const reason = quality.reason === "too_short" ? "demasiado corto"
+      : quality.reason === "inaudible" ? "señal demasiado baja"
+        : "no se detectó voz útil";
+    const detail = metrics ? `RMS ${metrics.rmsDbfs.toFixed(1)} dBFS · pico ${metrics.peakDbfs.toFixed(1)} dBFS · voz útil ${metrics.activeMs} ms` : "sin métricas";
+    await appendEvent("recording", `Audio descartado: ${reason} (${detail})`);
+    // A 2xx tells the ESP32 that the upload was processed, preventing retries.
+    return NextResponse.json({ id, discarded: true, reason: quality.reason, metrics: quality.metrics });
+  }
+
+  await ensureRecordingsDirectory();
   const filePath = path.join(recordingsDirectory, `${id}.wav`);
   const metadataPath = path.join(recordingsDirectory, `${id}.json`);
   const recipient = await getSelectedRecipient();
@@ -80,6 +108,8 @@ export async function POST(request: Request) {
     url: `/api/recordings/${id}`,
     size: buffer.length,
     durationMs,
+    discarded: false,
+    quality: quality.metrics,
   }, { status: 201 });
 }
 
@@ -109,7 +139,8 @@ export async function GET() {
   }));
 
   recordings.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  return NextResponse.json({ recordings }, { headers: { "Cache-Control": "no-store" } });
+  const latestAudioResult = await readLatestAudioResult();
+  return NextResponse.json({ recordings, latestAudioResult }, { headers: { "Cache-Control": "no-store" } });
 }
 
 export async function DELETE() {

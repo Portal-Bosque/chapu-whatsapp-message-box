@@ -25,6 +25,12 @@ type WhatsappStatus = {
   syncRunning: boolean;
   syncError: string | null;
 };
+type LatestAudioResult = {
+  id: string;
+  discarded: boolean;
+  reason: string;
+  metrics: { rmsDbfs: number; peakDbfs: number; activeMs: number } | null;
+};
 
 const wait = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 const HIDDEN_PHONE = "••• ••• •••…";
@@ -38,12 +44,13 @@ export function FamilyPanel() {
   const [phone, setPhone] = useState("");
   const [showPhone, setShowPhone] = useState(false);
   const [panelError, setPanelError] = useState("");
-  const [emeetState, setEmeetState] = useState<"idle" | "recording" | "sending" | "sent" | "error">("idle");
+  const [emeetState, setEmeetState] = useState<"idle" | "recording" | "sending" | "sent" | "discarded" | "error">("idle");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [chapuMessages, setChapuMessages] = useState<ChapuMessage[]>([]);
   const [deviceStatus, setDeviceStatus] = useState<DeviceStatus | null>(null);
   const [releasingMessage, setReleasingMessage] = useState(false);
   const previousRecordingId = useRef<string | null>(null);
+  const previousAudioResultId = useRef<string | null>(null);
 
   const loadWhatsapp = useCallback(async () => {
     try {
@@ -171,7 +178,13 @@ export function FamilyPanel() {
       const response = await fetch("/api/recordings", { cache: "no-store" });
       const data = await response.json() as {
         recordings: Array<{ id: string; delivery?: { status?: string; error?: string } }>;
+        latestAudioResult: LatestAudioResult | null;
       };
+      if (data.latestAudioResult?.id !== previousAudioResultId.current && data.latestAudioResult?.discarded) {
+        setEmeetState("discarded");
+        window.setTimeout(() => setEmeetState("idle"), 5000);
+        return;
+      }
       const newest = data.recordings[0];
       if (!newest || newest.id === previousRecordingId.current) continue;
       if (newest.delivery?.status === "sent") {
@@ -208,8 +221,9 @@ export function FamilyPanel() {
     }
 
     const beforeResponse = await fetch("/api/recordings", { cache: "no-store" });
-    const before = await beforeResponse.json() as { recordings: Array<{ id: string }> };
+    const before = await beforeResponse.json() as { recordings: Array<{ id: string }>; latestAudioResult: LatestAudioResult | null };
     previousRecordingId.current = before.recordings[0]?.id ?? null;
+    previousAudioResultId.current = before.latestAudioResult?.id ?? null;
     const command = await fetch("/api/device/record", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -306,6 +320,7 @@ export function FamilyPanel() {
             <strong>{emeetState === "recording" ? `Grabando… ${recordingSeconds} s · tocar para enviar`
               : emeetState === "sending" ? "Enviando por WhatsApp…"
                 : emeetState === "sent" ? "¡Mensaje enviado!"
+                  : emeetState === "discarded" ? "No se escuchó voz · no se envió"
                   : emeetState === "error" ? "Revisar el error"
                     : whatsapp?.authenticated ? `Hablar con ${selectedRecipient?.label ?? "destinatario"}`
                       : "Vinculá WhatsApp primero"}</strong>

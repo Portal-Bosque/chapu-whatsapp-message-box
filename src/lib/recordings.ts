@@ -2,9 +2,37 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 export const recordingsDirectory = path.join(process.cwd(), "data", "recordings");
+const latestAudioResultPath = path.join(process.cwd(), "data", "device", "latest-audio-result.json");
+
+export type LatestAudioResult = {
+  id: string;
+  processedAt: string;
+  discarded: boolean;
+  reason: string;
+  metrics: {
+    durationMs: number;
+    rmsDbfs: number;
+    peakDbfs: number;
+    activeMs: number;
+    activeRatio: number;
+  } | null;
+};
 
 export async function ensureRecordingsDirectory() {
   await fs.mkdir(recordingsDirectory, { recursive: true });
+}
+
+export async function writeLatestAudioResult(result: LatestAudioResult) {
+  await fs.mkdir(path.dirname(latestAudioResultPath), { recursive: true });
+  await fs.writeFile(latestAudioResultPath, JSON.stringify(result, null, 2));
+}
+
+export async function readLatestAudioResult(): Promise<LatestAudioResult | null> {
+  try {
+    return JSON.parse(await fs.readFile(latestAudioResultPath, "utf8")) as LatestAudioResult;
+  } catch {
+    return null;
+  }
 }
 
 export function isWave(buffer: Buffer) {

@@ -93,7 +93,7 @@ button, audio { font: inherit; }
 .hardware-listen-button:disabled { cursor: not-allowed; }
 .hardware-listen-button:disabled:not(.has-unheard) { filter: grayscale(.8); opacity: .48; }
 .hardware-listen-button.is-playing { cursor: wait; }
-.hardware-talk-button.is-recording { background: #ff5a4f; }.hardware-talk-button.is-sending { background: var(--yellow); }.hardware-talk-button.is-sent { background: var(--green); }
+.hardware-talk-button.is-recording { background: #ff5a4f; }.hardware-talk-button.is-sending { background: var(--yellow); }.hardware-talk-button.is-sent { background: var(--green); }.hardware-talk-button.is-discarded { background: #aaa69c; }
 .hardware-action > strong { min-height: 34px; margin-top: 18px; font-size: 12px; line-height: 1.35; }
 .mac-to-device-card { position: relative; overflow: hidden; border: 2px solid var(--ink); border-radius: 30px; background: var(--card); padding: 28px; }
 .direction-tag { display: inline-flex; padding: 7px 10px; border-radius: 999px; background: var(--yellow); font-size: 10px; font-weight: 900; letter-spacing: .1em; }
