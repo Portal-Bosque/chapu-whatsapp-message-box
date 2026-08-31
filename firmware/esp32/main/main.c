@@ -36,6 +36,7 @@ static bool s_wifi_ready = false;
 #define RECORD_LED_GPIO GPIO_NUM_5
 #define RECORD_BUTTON_DEBOUNCE_MS 50
 #define RECORD_LED_BLINK_MS 350
+#define RECORDING_CHIME_SETTLE_MS 350
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -170,8 +171,10 @@ static size_t s_mic_record_wr = 0;           // captured bytes
 static bool is_playing_back = false;
 static bool s_mic_recording = false;         // recording state
 static volatile bool s_stop_play_request = false; // request playback stop
-static int16_t *s_beep_pcm = NULL;
-static size_t s_beep_pcm_size = 0;
+static int16_t *s_start_chime_pcm = NULL;
+static size_t s_start_chime_pcm_size = 0;
+static int16_t *s_stop_chime_pcm = NULL;
+static size_t s_stop_chime_pcm_size = 0;
 #ifndef CONFIG_EXAMPLE_MIC_PLAYBACK
 extern const uint8_t message_box_test_pcm[];
 extern const unsigned int message_box_test_pcm_len;
@@ -186,9 +189,9 @@ typedef struct {
 } player_config_t;
 
 static void start_recording_cycle(void);
-static void start_recording_after_beep(void);
+static void start_recording_after_chime(void);
 static void stop_recording_cycle(void);
-static void play_recording_after_stop_beep(void);
+static void upload_recording_after_stop_chime(void);
 static void play_captured_recording(void);
 static void recording_playback_done_cb(void);
 static void remote_playback_done_cb(void);
@@ -386,52 +389,74 @@ static esp_err_t start_pcm_playback(player_config_t *config)
     return ESP_OK;
 }
 
-static void prepare_low_beep(void)
+static void fill_playful_chime(int16_t *pcm, uint32_t sample_rate, float first_hz, float second_hz)
 {
-    const uint32_t sample_rate = 48000;
-    const uint32_t duration_ms = 250;
-    const uint32_t frames = sample_rate * duration_ms / 1000;
-    const uint32_t ramp_frames = sample_rate / 100; // 10 ms fade at each end
-    s_beep_pcm_size = frames * 2 * sizeof(int16_t);
-    s_beep_pcm = malloc(s_beep_pcm_size);
-    assert(s_beep_pcm != NULL);
+    const uint32_t first_frames = sample_rate * 95 / 1000;
+    const uint32_t gap_frames = sample_rate * 25 / 1000;
+    const uint32_t second_frames = sample_rate * 145 / 1000;
+    const uint32_t frames = first_frames + gap_frames + second_frames;
 
     for (uint32_t frame = 0; frame < frames; frame++) {
-        float envelope = 1.0f;
-        if (frame < ramp_frames) {
-            envelope = (float)frame / ramp_frames;
-        } else if (frame >= frames - ramp_frames) {
-            envelope = (float)(frames - frame - 1) / ramp_frames;
-        }
-        int16_t sample = (int16_t)(10000.0f * envelope * sinf(2.0f * 3.14159265f * 220.0f * frame / sample_rate));
-        s_beep_pcm[frame * 2] = sample;
-        s_beep_pcm[frame * 2 + 1] = sample;
+        bool second_note = frame >= first_frames + gap_frames;
+        bool in_gap = frame >= first_frames && !second_note;
+        uint32_t note_frame = second_note ? frame - first_frames - gap_frames : frame;
+        uint32_t note_frames = second_note ? second_frames : first_frames;
+        float frequency = second_note ? second_hz : first_hz;
+        float progress = (float)note_frame / (float)note_frames;
+        float envelope = in_gap ? 0.0f : sinf(3.14159265f * progress) * (1.0f - 0.35f * progress);
+        float phase = 2.0f * 3.14159265f * frequency * note_frame / sample_rate;
+        float bell = sinf(phase) + 0.18f * sinf(phase * 2.0f);
+        int16_t sample = (int16_t)(6500.0f * envelope * bell);
+        pcm[frame * 2] = sample;
+        pcm[frame * 2 + 1] = sample;
     }
+}
+
+static void prepare_recording_chimes(void)
+{
+    const uint32_t sample_rate = 48000;
+    const uint32_t duration_ms = 95 + 25 + 145;
+    const uint32_t frames = sample_rate * duration_ms / 1000;
+    const size_t pcm_size = frames * 2 * sizeof(int16_t);
+
+    s_start_chime_pcm_size = pcm_size;
+    s_stop_chime_pcm_size = pcm_size;
+    s_start_chime_pcm = malloc(pcm_size);
+    s_stop_chime_pcm = malloc(pcm_size);
+    assert(s_start_chime_pcm != NULL && s_stop_chime_pcm != NULL);
+
+    // Start goes up (E5 -> B5); stop answers by going down.
+    fill_playful_chime(s_start_chime_pcm, sample_rate, 659.25f, 987.77f);
+    fill_playful_chime(s_stop_chime_pcm, sample_rate, 987.77f, 659.25f);
 }
 
 static void start_recording_cycle(void)
 {
-    if (s_spk_dev_handle == NULL || s_mic_dev_handle == NULL || s_beep_pcm == NULL || s_play_task_handle != NULL) {
+    if (s_spk_dev_handle == NULL || s_mic_dev_handle == NULL || s_start_chime_pcm == NULL || s_play_task_handle != NULL) {
         ESP_LOGW(TAG, "Could not start recording: audio device is busy or unavailable");
         s_recording_indicator = false;
         s_emeet_cycle_active = false;
         return;
     }
-    ESP_LOGI(TAG, "Start beep");
-    player_config_t beep = {
-        .pcm_ptr = (const uint8_t *)s_beep_pcm,
-        .pcm_size = s_beep_pcm_size,
-        .complete_cb = start_recording_after_beep,
+    ESP_LOGI(TAG, "Playing start-recording chime");
+    player_config_t chime = {
+        .pcm_ptr = (const uint8_t *)s_start_chime_pcm,
+        .pcm_size = s_start_chime_pcm_size,
+        .complete_cb = start_recording_after_chime,
     };
-    if (start_pcm_playback(&beep) != ESP_OK) {
-        ESP_LOGE(TAG, "Could not play the start-recording beep");
+    if (start_pcm_playback(&chime) != ESP_OK) {
+        ESP_LOGE(TAG, "Could not play the start-recording chime");
         s_recording_indicator = false;
         s_emeet_cycle_active = false;
     }
 }
 
-static void start_recording_after_beep(void)
+static void start_recording_after_chime(void)
 {
+    // USB playback may have completed while the EMEET speaker is still
+    // physically ringing. Keep its microphone paused until the chime decays,
+    // otherwise the first samples of the voice note contain our own cue.
+    vTaskDelay(pdMS_TO_TICKS(RECORDING_CHIME_SETTLE_MS));
     if (s_mic_dev_handle != NULL && uac_host_device_resume(s_mic_dev_handle) == ESP_OK) {
         s_mic_record_wr = 0;
         s_mic_recording = true;
@@ -455,13 +480,13 @@ static void stop_recording_cycle(void)
     s_recording_indicator = false;
     uac_host_device_suspend(s_mic_dev_handle);
     ESP_LOGI(TAG, "Recording stopped at %u bytes", (unsigned)s_mic_record_wr);
-    player_config_t stop_beep = {
-        .pcm_ptr = (const uint8_t *)s_beep_pcm,
-        .pcm_size = s_beep_pcm_size,
-        .complete_cb = play_recording_after_stop_beep,
+    player_config_t stop_chime = {
+        .pcm_ptr = (const uint8_t *)s_stop_chime_pcm,
+        .pcm_size = s_stop_chime_pcm_size,
+        .complete_cb = upload_recording_after_stop_chime,
     };
-    if (start_pcm_playback(&stop_beep) != ESP_OK) {
-        play_recording_after_stop_beep();
+    if (start_pcm_playback(&stop_chime) != ESP_OK) {
+        upload_recording_after_stop_chime();
     }
 }
 
@@ -585,7 +610,7 @@ static esp_err_t acknowledge_remote_message(void)
 
 static esp_err_t fetch_record_command(void)
 {
-    if (s_mic_dev_handle == NULL || s_beep_pcm == NULL) {
+    if (s_mic_dev_handle == NULL || s_start_chime_pcm == NULL) {
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -913,7 +938,7 @@ static void upload_recording_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static void play_recording_after_stop_beep(void)
+static void upload_recording_after_stop_chime(void)
 {
     BaseType_t created = xTaskCreatePinnedToCore(upload_recording_task, "audio_upload", 8192, NULL,
                                                  USER_TASK_PRIORITY, NULL, 1);
@@ -1223,7 +1248,7 @@ void app_main(void)
 {
     record_button_gpio_init();
     wifi_init_sta();
-    prepare_low_beep();
+    prepare_recording_chimes();
     s_event_queue = xQueueCreate(10, sizeof(s_event_queue_t));
     assert(s_event_queue != NULL);
 

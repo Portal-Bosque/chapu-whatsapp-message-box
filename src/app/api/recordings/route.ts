@@ -31,7 +31,10 @@ export async function POST(request: Request) {
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const id = `${timestamp}_${randomUUID().slice(0, 8)}`;
+  await appendEvent("recording", "Procesando audio: buscando voz y midiendo el nivel de sonido…");
+  const analysisStartedAt = performance.now();
   const quality = analyzeAudioQuality(buffer);
+  const analysisElapsedMs = performance.now() - analysisStartedAt;
   const audioResult = {
     id,
     processedAt: new Date().toISOString(),
@@ -72,7 +75,7 @@ export async function POST(request: Request) {
     fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2), { flag: "wx" }),
   ]);
   const durationMs = wavDurationMs(buffer);
-  await appendEvent("recording", `Audio recibido desde el EMEET: ${durationMs === null ? "duración desconocida" : `${(durationMs / 1000).toFixed(1)} s`}`);
+  await appendEvent("recording", `Audio válido: se detectó voz en ${analysisElapsedMs.toFixed(0)} ms · ${durationMs === null ? "duración desconocida" : `${(durationMs / 1000).toFixed(1)} s`}`);
   const deliveryStartedAt = performance.now();
 
   void sendVoiceMessage(filePath, recipient.phone, id).then(async (result) => {
