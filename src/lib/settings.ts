@@ -83,7 +83,8 @@ export async function addRecipient(label: string, phone: string) {
   if (settings.recipients.length >= AGENDA_SLOTS) {
     throw new Error(`La caja tiene ${AGENDA_SLOTS} botones de agenda; editá uno existente`);
   }
-  const colors = ["#ffca46", "#57a8ff", "#ff7f74", "#b48cff"];
+  // Matches the lamp colour of the slot the new contact lands on (green, yellow, blue, red).
+  const colors = ["#19c96b", "#ffca46", "#3b8cff", "#ef4438"];
   const recipient: Recipient = {
     id: randomUUID().slice(0, 8),
     label: label.trim().slice(0, 24) || normalizedPhone,

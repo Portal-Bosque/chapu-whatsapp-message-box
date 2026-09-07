@@ -7,6 +7,8 @@
   --green: #19c96b;
   --green-dark: #078a46;
   --yellow: #ffca46;
+  --blue: #2f7ff5;
+  --red: #e8342b;
   --muted: #6d6a62;
 }
 
@@ -66,7 +68,7 @@ button, audio { font: inherit; }
 .recipient-arcade-button { width: 112px; border: 0; padding: 0; background: transparent; color: var(--ink); cursor: pointer; text-align: center; }
 .recipient-arcade-button i { width: 60px; height: 60px; margin: 0 auto 8px; display: grid; place-items: center; border: 6px solid var(--ink); border-radius: 50%; box-shadow: inset 0 5px 8px rgba(255,255,255,.42), 0 6px 0 #090909; font-style: normal; font-size: 28px; font-weight: 900; transition: transform .14s ease, box-shadow .14s ease; }
 .recipient-arcade-button:hover i { transform: translateY(-2px); box-shadow: inset 0 5px 8px rgba(255,255,255,.5), 0 8px 0 #090909; }
-.recipient-arcade-button.is-selected i { outline: 4px solid var(--green); outline-offset: 4px; }
+.recipient-arcade-button.is-selected i { outline: 4px solid var(--ink); outline-offset: 4px; }
 .recipient-arcade-button strong, .recipient-arcade-button small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .recipient-arcade-button strong { font-size: 13px; }.recipient-arcade-button small { margin-top: 3px; color: var(--muted); font-size: 9px; letter-spacing: .02em; }
 .recipient-buttons .add-person-button i { background: transparent; border-style: dashed; box-shadow: none; }
@@ -84,16 +86,16 @@ button, audio { font: inherit; }
 .hardware-action .panel-label { min-height: 28px; margin-bottom: 8px; }
 .hardware-talk-button, .hardware-listen-button { position: relative; width: 168px; height: 168px; display: grid; place-items: center; overflow: hidden; border: 13px solid #111; border-radius: 50%; box-shadow: inset 0 -10px 16px rgba(0,0,0,.2), 0 11px 0 #080808, 0 18px 25px rgba(29,29,27,.22); cursor: pointer; transition: transform .14s ease, box-shadow .14s ease, background .2s ease, opacity .2s ease; }
 .hardware-talk-button::before, .hardware-listen-button::before { content: ""; position: absolute; z-index: 1; left: 24px; top: 15px; width: 84px; height: 42px; border-radius: 50%; background: radial-gradient(ellipse, rgba(255,255,255,.72), rgba(255,255,255,0) 72%); transform: rotate(-12deg); pointer-events: none; }
-.hardware-talk-button { background: radial-gradient(circle at 48% 70%, #05a956 0 34%, #13ce69 61%, #83f2b7 100%); }
+.hardware-talk-button { background: radial-gradient(circle at 48% 70%, #c4211a 0 34%, #ef4438 61%, #ffa39b 100%); }
 .hardware-talk-button span { display: none; }
-.hardware-listen-button { background: radial-gradient(circle at 48% 70%, #e9a817 0 34%, #ffca46 61%, #ffe7a0 100%); }
+.hardware-listen-button { background: radial-gradient(circle at 48% 70%, #1d5fd1 0 34%, #3b8cff 61%, #a6ccff 100%); }
 .hardware-listen-button span { position: relative; z-index: 2; width: 0; height: 0; margin-left: 10px; border-top: 25px solid transparent; border-bottom: 25px solid transparent; border-left: 39px solid var(--ink); filter: drop-shadow(0 2px 0 rgba(255,255,255,.25)); }
 .hardware-talk-button:active:not(:disabled), .hardware-listen-button:active:not(:disabled) { transform: translateY(9px); box-shadow: inset 0 -5px 12px rgba(0,0,0,.24), 0 3px 0 #080808, 0 8px 12px rgba(29,29,27,.18); }
 .hardware-talk-button:disabled { cursor: not-allowed; filter: grayscale(.75); opacity: .6; }
 .hardware-listen-button:disabled { cursor: not-allowed; }
 .hardware-listen-button:disabled:not(.has-unheard) { filter: grayscale(.8); opacity: .48; }
 .hardware-listen-button.is-playing { cursor: wait; }
-.hardware-talk-button.is-recording { background: #ff5a4f; }.hardware-talk-button.is-sending { background: var(--yellow); }.hardware-talk-button.is-sent { background: var(--green); }.hardware-talk-button.is-discarded { background: #aaa69c; }
+.hardware-talk-button.is-recording { background: #ff3b2e; }.hardware-talk-button.is-sending { background: var(--yellow); }.hardware-talk-button.is-sent { background: var(--green); }.hardware-talk-button.is-discarded { background: #aaa69c; }
 .hardware-action > strong { min-height: 34px; margin-top: 18px; font-size: 12px; line-height: 1.35; }
 .mac-to-device-card { position: relative; overflow: hidden; border: 2px solid var(--ink); border-radius: 30px; background: var(--card); padding: 28px; }
 .direction-tag { display: inline-flex; padding: 7px 10px; border-radius: 999px; background: var(--yellow); font-size: 10px; font-weight: 900; letter-spacing: .1em; }
@@ -220,8 +222,8 @@ footer span:first-child { color: var(--ink); font-weight: 800; }
   .hardware-talk-button.is-recording { animation: recording-alert .7s step-end infinite; }
   @keyframes pulse { 50% { box-shadow: 0 0 0 8px rgba(25,201,107,0); } }
   @keyframes message-alert {
-    0%, 100% { filter: brightness(1); box-shadow: inset 0 -10px 16px rgba(0,0,0,.2), 0 11px 0 #080808, 0 18px 25px rgba(29,29,27,.22), 0 0 0 0 rgba(255,202,70,.75); }
-    50% { filter: brightness(1.25); box-shadow: inset 0 -10px 16px rgba(0,0,0,.14), 0 11px 0 #080808, 0 18px 25px rgba(29,29,27,.22), 0 0 0 15px rgba(255,202,70,.2); }
+    0%, 100% { filter: brightness(1); box-shadow: inset 0 -10px 16px rgba(0,0,0,.2), 0 11px 0 #080808, 0 18px 25px rgba(29,29,27,.22), 0 0 0 0 rgba(59,140,255,.75); }
+    50% { filter: brightness(1.25); box-shadow: inset 0 -10px 16px rgba(0,0,0,.14), 0 11px 0 #080808, 0 18px 25px rgba(29,29,27,.22), 0 0 0 15px rgba(59,140,255,.25); }
   }
   @keyframes recording-alert {
     0%, 100% { filter: brightness(1); box-shadow: inset 0 -10px 16px rgba(0,0,0,.2), 0 11px 0 #080808, 0 18px 25px rgba(29,29,27,.22), 0 0 0 0 rgba(255,90,79,.75); }

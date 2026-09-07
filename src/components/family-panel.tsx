@@ -6,6 +6,9 @@ import { EventLog } from "@/components/event-log";
 import { NameRecorder } from "@/components/name-recorder";
 
 type Recipient = { id: string; label: string; phone: string; color: string; nameSource?: "recorded" | "generated" };
+
+// Lamp colours of the four agenda buttons on the physical box, by position.
+const AGENDA_SLOT_COLORS = ["#19c96b", "#ffca46", "#3b8cff", "#ef4438"];
 type WhatsappGroup = { jid: string; name: string; joined: boolean };
 const groupLabel = (group: WhatsappGroup) => group.name || `Grupo sin nombre · …${group.jid.replace(/@g\.us$/, "").slice(-4)}`;
 const isGroupDestination = (value: string) => /^\d{5,}@g\.us$/.test(value);
@@ -431,7 +434,7 @@ export function FamilyPanel() {
                   aria-label={`Elegir a ${recipient.label} (botón ${index + 1} de la caja)`}
                   title={`Botón ${index + 1} de la caja`}
                 >
-                  <i style={{ background: recipient.color }}>{index + 1}</i>
+                  <i style={{ background: AGENDA_SLOT_COLORS[index] }}>{index + 1}</i>
                   <strong>{recipient.label}</strong>
                   <small>{isGroupDestination(recipient.phone) ? "grupo de WhatsApp" : HIDDEN_PHONE}</small>
                 </button>
