@@ -123,6 +123,10 @@ export async function isWhatsappReady() {
 }
 
 export async function ensureWacliSync(webhookOrigin: string) {
+  // A dev server next to the production service must not start a second
+  // listener: the store lock is held by the service, and sends still work
+  // through its delegate socket.
+  if (process.env.CHAPU_NO_SYNC === "1") return;
   if (authRuntime.syncProcess || authRuntime.syncPaused) return;
   const status = await getWacliAuthStatus();
   if (!status.authenticated) return;

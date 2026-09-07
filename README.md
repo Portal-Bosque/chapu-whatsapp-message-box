@@ -65,6 +65,16 @@ reinicia el servicio. `data/` vive únicamente en la mini. Log del servicio en
 `~/Library/Logs/chapu/server.log`. No correr `npm start` en otra máquina con la
 misma sesión de WhatsApp: wacli solo puede estar conectado desde un lugar.
 
+Para desarrollar en la misma mini mientras el servicio corre:
+
+```bash
+CHAPU_NO_SYNC=1 PORT=3001 npm run dev
+```
+
+`CHAPU_NO_SYNC=1` evita lanzar una segunda escucha de WhatsApp; los envíos
+desde el server de desarrollo salen igual, delegados por el socket del
+servicio, y los mensajes entrantes siguen llegando por el servicio.
+
 ## Firmware
 
 Las instrucciones de configuración, compilación y carga están en
