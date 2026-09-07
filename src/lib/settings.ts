@@ -14,6 +14,9 @@ export type MessageBoxSettings = {
   selectedRecipientId: string;
 };
 
+// Physical agenda buttons on the box, in the same order as `recipients`.
+export const AGENDA_SLOTS = 4;
+
 const settingsPath = path.join(process.cwd(), "data", "settings.json");
 const defaultSettings: MessageBoxSettings = {
   recipients: [{
@@ -25,11 +28,20 @@ const defaultSettings: MessageBoxSettings = {
   selectedRecipientId: "self",
 };
 
+// A destination is either an international phone number or a WhatsApp group
+// JID such as 120363012345678901@g.us; both are stored in `phone`.
+const GROUP_JID = /^\d{5,}@g\.us$/;
+
+export function isGroupDestination(destination: string) {
+  return GROUP_JID.test(destination);
+}
+
 function normalizePhone(phone: string) {
   const trimmed = phone.trim();
+  if (isGroupDestination(trimmed)) return trimmed;
   const digits = trimmed.replace(/\D/g, "");
   if (digits.length < 8 || digits.length > 15) {
-    throw new Error("Ingresá un número internacional válido");
+    throw new Error("Ingresá un número internacional válido o elegí un grupo");
   }
   return `+${digits}`;
 }
@@ -68,6 +80,9 @@ export async function addRecipient(label: string, phone: string) {
     await writeSettings(settings);
     return settings;
   }
+  if (settings.recipients.length >= AGENDA_SLOTS) {
+    throw new Error(`La caja tiene ${AGENDA_SLOTS} botones de agenda; editá uno existente`);
+  }
   const colors = ["#ffca46", "#57a8ff", "#ff7f74", "#b48cff"];
   const recipient: Recipient = {
     id: randomUUID().slice(0, 8),
@@ -97,6 +112,25 @@ export async function updateRecipient(id: string, label: string, phone: string) 
   recipient.phone = normalizedPhone;
   await writeSettings(settings);
   return settings;
+}
+
+/**
+ * Moves a contact to another agenda button. Buttons map to positions in
+ * `recipients`, so this swaps positions; a target beyond the last contact
+ * moves it to the end (the first free button).
+ */
+export async function moveRecipient(id: string, toSlot: number) {
+  const settings = await readSettings();
+  const fromIndex = settings.recipients.findIndex((recipient) => recipient.id === id);
+  if (fromIndex < 0) throw new Error("Destinatario desconocido");
+  if (!Number.isInteger(toSlot) || toSlot < 0 || toSlot >= AGENDA_SLOTS) throw new Error("Botón inválido");
+
+  const toIndex = Math.min(toSlot, settings.recipients.length - 1);
+  if (toIndex === fromIndex) return { settings, swappedWith: null };
+  const swappedWith = settings.recipients[toIndex];
+  [settings.recipients[fromIndex], settings.recipients[toIndex]] = [settings.recipients[toIndex], settings.recipients[fromIndex]];
+  await writeSettings(settings);
+  return { settings, swappedWith };
 }
 
 export async function getSelectedRecipient() {

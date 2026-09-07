@@ -228,3 +228,26 @@ footer span:first-child { color: var(--ink); font-weight: 800; }
     50% { filter: brightness(1.35); box-shadow: inset 0 -10px 16px rgba(0,0,0,.14), 0 11px 0 #080808, 0 18px 25px rgba(29,29,27,.22), 0 0 0 15px rgba(255,90,79,.18); }
   }
 }
+
+.name-recorder { grid-column: 1 / -1; display: grid; gap: 10px; padding: 14px; border: 2px dashed var(--ink); border-radius: 14px; background: rgba(255,255,255,.35); }
+.name-recorder-status { display: grid; gap: 2px; }
+.name-recorder-status span { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; font-weight: 700; opacity: .7; }
+.name-recorder audio { width: 100%; height: 36px; }
+.name-recorder-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.record-name-button.is-recording { background: var(--red, #ff7f74); color: #111; }
+.name-recorder-error { margin: 0; color: var(--red, #c0392b); font-size: 13px; }
+.name-recorder-hint { grid-column: 1 / -1; margin: 0; font-size: 13px; opacity: .75; }
+
+.destination-kind { display: inline-flex; border: 2px solid var(--ink); border-radius: 999px; overflow: hidden; }
+.destination-kind button { border: 0; background: transparent; padding: 6px 14px; font-weight: 700; cursor: pointer; color: var(--ink); }
+.destination-kind button.is-active { background: var(--ink); color: #fff; }
+.phone-editor select { width: 100%; min-width: 0; padding: 8px 88px 8px 10px; border: 2px solid var(--ink); border-radius: 10px; background: #fff; font: inherit; }
+
+.slot-mover { grid-column: 1 / -1; display: grid; gap: 8px; }
+.slot-mover > span { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; font-weight: 700; opacity: .7; }
+.slot-mover-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.slot-mover-buttons button { display: grid; justify-items: center; gap: 4px; min-width: 96px; padding: 8px 10px; border: 2px solid var(--ink); border-radius: 12px; background: #fff; color: var(--ink); cursor: pointer; font: inherit; }
+.slot-mover-buttons button i { font-style: normal; font-weight: 900; font-size: 20px; }
+.slot-mover-buttons button small { font-size: 11px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slot-mover-buttons button.is-current { background: var(--ink); color: #fff; cursor: default; }
+.slot-mover-buttons button:not(.is-current):hover { transform: translateY(-1px); }

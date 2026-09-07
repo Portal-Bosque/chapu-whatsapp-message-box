@@ -4,8 +4,9 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { NextResponse } from "next/server";
 import { appendEvent } from "@/lib/events";
+import { sendReminderCue } from "@/lib/reminders";
 import { ensureOutboxDirectories, queuedDirectory } from "@/lib/outbox";
-import { readSettings } from "@/lib/settings";
+import { isGroupDestination, readSettings } from "@/lib/settings";
 import { wacliStoreDirectory } from "@/lib/wacli";
 
 export const runtime = "nodejs";
@@ -28,7 +29,10 @@ function jidDigits(jid?: string) {
   return (jid?.split("@")[0] ?? "").replace(/\D/g, "");
 }
 
-async function processIncomingAudio(message: Required<Pick<IncomingMessage, "Chat" | "ID">>, senderLabel: string) {
+type Sender = { id: string; label: string } | null;
+
+async function processIncomingAudio(message: Required<Pick<IncomingMessage, "Chat" | "ID">>, sender: Sender) {
+  const senderLabel = sender?.label ?? "desconocido";
   const safeId = message.ID.replace(/[^a-zA-Z0-9_-]/g, "_");
   const markerPath = path.join(incomingDirectory, `${safeId}.json`);
   const sourcePath = path.join(incomingDirectory, `${safeId}.media`);
@@ -59,8 +63,16 @@ async function processIncomingAudio(message: Required<Pick<IncomingMessage, "Cha
 
     await ensureOutboxDirectories();
     await fs.rename(waveTempPath, outboxPath);
-    await fs.writeFile(markerPath, JSON.stringify({ status: "queued", senderLabel, queuedAt: new Date().toISOString() }, null, 2));
+    await fs.writeFile(markerPath, JSON.stringify({
+      status: "queued",
+      senderId: sender?.id ?? null,
+      senderLabel,
+      queuedAt: new Date().toISOString(),
+    }, null, 2));
     await appendEvent("device", `Nota de voz de ${senderLabel} guardada en la cola de Chapu`);
+    // The arrival cue plays right away at any hour; the 1/10/60-minute
+    // reminders and the boot cue respect the waking window.
+    await sendReminderCue("mensaje nuevo", { force: true, ignoreWindow: true, sender });
   } catch (error) {
     const detail = error instanceof Error ? error.message.split("\n")[0] : "error desconocido";
     await fs.writeFile(markerPath, JSON.stringify({ status: "error", detail, updatedAt: new Date().toISOString() }, null, 2));
@@ -84,18 +96,23 @@ export async function POST(request: Request) {
   if (message.Media?.Type?.toLowerCase() !== "audio") {
     return NextResponse.json({ ignored: true, reason: "not-audio" });
   }
-  if (message.Chat.endsWith("@g.us") || message.Chat.includes("broadcast")) {
-    await appendEvent("whatsapp", "Audio de grupo/estado ignorado");
-    return NextResponse.json({ ignored: true, reason: "not-direct" });
+  if (message.Chat.includes("broadcast")) {
+    return NextResponse.json({ ignored: true, reason: "broadcast" });
   }
 
   const settings = await readSettings();
+  const isGroupChat = message.Chat.endsWith("@g.us");
   const candidates = new Set([jidDigits(message.SenderJID), jidDigits(message.Chat)].filter(Boolean));
-  const allowed = settings.recipients.find((recipient) => candidates.has(recipient.phone.replace(/\D/g, "")));
-  if (!allowed) {
-    await appendEvent("whatsapp", `Audio entrante ignorado: ${message.PushName || message.ChatName || "número no autorizado"} no está en los botones`);
-    return NextResponse.json({ ignored: true, reason: "sender-not-allowed" });
+  const known = settings.recipients.find((recipient) => isGroupDestination(recipient.phone)
+    ? recipient.phone === message.Chat
+    : !isGroupChat && candidates.has(recipient.phone.replace(/\D/g, "")));
+  if (isGroupChat && !known) {
+    // Only groups that have their own agenda button reach Chapu.
+    await appendEvent("whatsapp", `Audio de un grupo sin botón ignorado (${message.ChatName || "grupo"})`);
+    return NextResponse.json({ ignored: true, reason: "group-not-in-agenda" });
   }
+  // Numbers outside the agenda are accepted too; Chapu announces them as "desconocido".
+  const sender: Sender = known ? { id: known.id, label: known.label } : null;
 
   await fs.mkdir(incomingDirectory, { recursive: true });
   const safeId = message.ID.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -109,8 +126,8 @@ export async function POST(request: Request) {
     throw error;
   }
 
-  const senderLabel = allowed.label;
+  const senderLabel = sender?.label ?? `desconocido (${message.PushName || message.ChatName || "sin nombre"})`;
   await appendEvent("whatsapp", `Nueva nota de voz recibida de ${senderLabel}`);
-  void processIncomingAudio({ Chat: message.Chat, ID: message.ID }, senderLabel);
+  void processIncomingAudio({ Chat: message.Chat, ID: message.ID }, sender);
   return NextResponse.json({ accepted: true }, { status: 202 });
 }

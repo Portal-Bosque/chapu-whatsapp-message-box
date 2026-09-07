@@ -3,8 +3,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import { EventLog } from "@/components/event-log";
+import { NameRecorder } from "@/components/name-recorder";
 
-type Recipient = { id: string; label: string; phone: string; color: string };
+type Recipient = { id: string; label: string; phone: string; color: string; nameSource?: "recorded" | "generated" };
+type WhatsappGroup = { jid: string; name: string; joined: boolean };
+const groupLabel = (group: WhatsappGroup) => group.name || `Grupo sin nombre · …${group.jid.replace(/@g\.us$/, "").slice(-4)}`;
+const isGroupDestination = (value: string) => /^\d{5,}@g\.us$/.test(value);
 type Settings = { recipients: Recipient[]; selectedRecipientId: string };
 type ChapuMessage = { id: string; status: "queued" | "pending" | "played" };
 type DeviceStatus = {
@@ -43,6 +47,9 @@ export function FamilyPanel() {
   const [label, setLabel] = useState("");
   const [phone, setPhone] = useState("");
   const [showPhone, setShowPhone] = useState(false);
+  const [destinationKind, setDestinationKind] = useState<"phone" | "group">("phone");
+  const [groups, setGroups] = useState<WhatsappGroup[]>([]);
+  const [groupsError, setGroupsError] = useState("");
   const [panelError, setPanelError] = useState("");
   const [emeetState, setEmeetState] = useState<"idle" | "recording" | "sending" | "sent" | "discarded" | "error">("idle");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
@@ -81,14 +88,25 @@ export function FamilyPanel() {
     }
   }, []);
 
+  // Polled so that the agenda buttons on the physical box are reflected here.
+  const loadSettings = useCallback(async () => {
+    try {
+      const response = await fetch("/api/settings", { cache: "no-store" });
+      if (response.ok) setSettings(await response.json() as Settings);
+    } catch {
+      // The next poll will refresh the agenda when the local server returns.
+    }
+  }, []);
+
   useEffect(() => {
-    void fetch("/api/settings", { cache: "no-store" }).then((response) => response.json()).then(setSettings);
     const initialLoad = window.setTimeout(() => {
+      void loadSettings();
       void loadWhatsapp();
       void loadChapuQueue();
       void loadDeviceStatus();
     }, 0);
     const interval = window.setInterval(() => {
+      void loadSettings();
       void loadWhatsapp();
       void loadChapuQueue();
       void loadDeviceStatus();
@@ -97,7 +115,7 @@ export function FamilyPanel() {
       window.clearTimeout(initialLoad);
       window.clearInterval(interval);
     };
-  }, [loadChapuQueue, loadDeviceStatus, loadWhatsapp]);
+  }, [loadChapuQueue, loadDeviceStatus, loadSettings, loadWhatsapp]);
 
   useEffect(() => {
     if (emeetState !== "recording") return;
@@ -107,6 +125,31 @@ export function FamilyPanel() {
     }, 250);
     return () => window.clearInterval(interval);
   }, [emeetState]);
+
+  const [refreshingGroups, setRefreshingGroups] = useState(false);
+
+  const loadGroups = async (refresh = false) => {
+    setGroupsError("");
+    if (refresh) setRefreshingGroups(true);
+    try {
+      const response = await fetch("/api/whatsapp/groups", { method: refresh ? "POST" : "GET", cache: "no-store" });
+      const data = await response.json() as { groups: WhatsappGroup[]; error?: string };
+      setGroups(data.groups);
+      if (data.error) setGroupsError(data.error);
+      else if (data.groups.length === 0) setGroupsError("Sin grupos: tocá Actualizar para pedirle la lista a WhatsApp");
+    } catch {
+      setGroupsError("No se pudieron listar los grupos");
+    } finally {
+      setRefreshingGroups(false);
+    }
+  };
+
+  const chooseDestinationKind = (kind: "phone" | "group") => {
+    setDestinationKind(kind);
+    setPhone("");
+    setShowPhone(false);
+    if (kind === "group") void loadGroups();
+  };
 
   const startWhatsappLogin = async () => {
     setPanelError("");
@@ -148,11 +191,27 @@ export function FamilyPanel() {
     setEditingRecipientId(null);
   };
 
+  const moveRecipientToSlot = async (id: string, toSlot: number) => {
+    setPanelError("");
+    const response = await fetch("/api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, toSlot }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setPanelError(data.error ?? "No se pudo mover el contacto");
+      return;
+    }
+    setSettings(data as Settings);
+  };
+
   const openNewRecipient = () => {
     setEditingRecipientId(null);
     setLabel("");
     setPhone("");
     setShowPhone(false);
+    setDestinationKind("phone");
     setShowAddRecipient(true);
   };
 
@@ -161,6 +220,9 @@ export function FamilyPanel() {
     setLabel(recipient.label);
     setPhone(recipient.phone);
     setShowPhone(false);
+    const kind = isGroupDestination(recipient.phone) ? "group" : "phone";
+    setDestinationKind(kind);
+    if (kind === "group") void loadGroups();
     setShowAddRecipient(true);
   };
 
@@ -254,9 +316,11 @@ export function FamilyPanel() {
   };
 
   const selectedRecipient = settings?.recipients.find((recipient) => recipient.id === settings.selectedRecipientId);
+  const editingRecipient = settings?.recipients.find((recipient) => recipient.id === editingRecipientId) ?? null;
   const agendaSlots = Array.from({ length: 4 }, (_, index) => settings?.recipients[index] ?? null);
   const queuedMessages = chapuMessages.filter((message) => message.status === "queued").length;
   const messagePlaying = chapuMessages.some((message) => message.status === "pending");
+  const hasPlayedMessage = chapuMessages.some((message) => message.status === "played");
   const unheardMessages = queuedMessages + (messagePlaying ? 1 : 0);
   const deviceHealth = deviceStatus?.functional ? "ready"
     : deviceStatus?.espConnected ? "partial"
@@ -341,15 +405,17 @@ export function FamilyPanel() {
             <button
               className={`hardware-listen-button ${unheardMessages > 0 ? "has-unheard" : ""} ${messagePlaying ? "is-playing" : ""}`}
               type="button"
-              disabled={queuedMessages === 0 || messagePlaying || releasingMessage}
+              disabled={(queuedMessages === 0 && !hasPlayedMessage) || messagePlaying || releasingMessage}
               onClick={() => void listenToNextMessage()}
-              aria-label={queuedMessages > 0 ? `Escuchar próximo mensaje. ${queuedMessages} en cola` : "No hay mensajes por escuchar"}
+              aria-label={queuedMessages > 0 ? `Escuchar próximo mensaje. ${queuedMessages} en cola`
+                : hasPlayedMessage ? "Volver a escuchar el último mensaje" : "No hay mensajes por escuchar"}
             ><span aria-hidden="true" /></button>
             <strong>{messagePlaying ? "Chapu está reproduciendo…"
               : releasingMessage ? "Preparando audio…"
                 : queuedMessages === 1 ? "1 mensaje por escuchar"
                   : queuedMessages > 1 ? `${queuedMessages} mensajes por escuchar`
-                    : "Sin mensajes nuevos"}</strong>
+                    : hasPlayedMessage ? "Sin mensajes nuevos · tocar para repetir el último"
+                      : "Sin mensajes nuevos"}</strong>
           </div>
         </div>
 
@@ -362,11 +428,12 @@ export function FamilyPanel() {
                   className={`recipient-arcade-button ${recipient.id === settings?.selectedRecipientId ? "is-selected" : ""}`}
                   type="button"
                   onClick={() => void chooseRecipient(recipient.id)}
-                  aria-label={`Elegir a ${recipient.label}`}
+                  aria-label={`Elegir a ${recipient.label} (botón ${index + 1} de la caja)`}
+                  title={`Botón ${index + 1} de la caja`}
                 >
-                  <i style={{ background: recipient.color }} />
+                  <i style={{ background: recipient.color }}>{index + 1}</i>
                   <strong>{recipient.label}</strong>
-                  <small>{HIDDEN_PHONE}</small>
+                  <small>{isGroupDestination(recipient.phone) ? "grupo de WhatsApp" : HIDDEN_PHONE}</small>
                 </button>
                 <button className="edit-recipient-button" type="button" onClick={() => openRecipientEditor(recipient)}>
                   Editar
@@ -380,7 +447,7 @@ export function FamilyPanel() {
                   onClick={openNewRecipient}
                   aria-label={`Agregar contacto en posición ${index + 1}`}
                 >
-                  <i>+</i><strong>Agregar</strong><small>{HIDDEN_PHONE}</small>
+                  <i>{index + 1}</i><strong>Agregar</strong><small>{HIDDEN_PHONE}</small>
                 </button>
               </div>
             ))}
@@ -389,19 +456,69 @@ export function FamilyPanel() {
             <form className="recipient-form" onSubmit={(event) => void saveRecipient(event)}>
               <div className="recipient-form-title">{editingRecipientId ? "Editar contacto" : "Nuevo contacto"}</div>
               <input aria-label="Nombre" placeholder="Nombre o label" value={label} onChange={(event) => setLabel(event.target.value)} />
-              <div className="phone-editor">
-                <input
-                  aria-label="Número internacional"
-                  type={showPhone ? "tel" : "password"}
-                  autoComplete="off"
-                  placeholder="+54911…"
-                  value={phone}
-                  onChange={(event) => setPhone(event.target.value)}
-                />
-                <button type="button" onClick={() => setShowPhone((value) => !value)}>{showPhone ? "Ocultar" : "Ver"}</button>
+              <div className="destination-kind" role="radiogroup" aria-label="Tipo de destino">
+                <button type="button" className={destinationKind === "phone" ? "is-active" : ""} onClick={() => chooseDestinationKind("phone")}>Número</button>
+                <button type="button" className={destinationKind === "group" ? "is-active" : ""} onClick={() => chooseDestinationKind("group")}>Grupo</button>
               </div>
+              {destinationKind === "phone" ? (
+                <div className="phone-editor">
+                  <input
+                    aria-label="Número internacional"
+                    type={showPhone ? "tel" : "password"}
+                    autoComplete="off"
+                    placeholder="+54911…"
+                    value={phone}
+                    onChange={(event) => setPhone(event.target.value)}
+                  />
+                  <button type="button" onClick={() => setShowPhone((value) => !value)}>{showPhone ? "Ocultar" : "Ver"}</button>
+                </div>
+              ) : (
+                <div className="phone-editor">
+                  <select aria-label="Grupo de WhatsApp" value={phone} onChange={(event) => setPhone(event.target.value)}>
+                    <option value="">Elegí un grupo…</option>
+                    {groups.map((group) => <option key={group.jid} value={group.jid}>{groupLabel(group)}</option>)}
+                    {phone && !groups.some((group) => group.jid === phone) && <option value={phone}>Grupo actual</option>}
+                  </select>
+                  <button type="button" disabled={refreshingGroups} onClick={() => void loadGroups(true)}>{refreshingGroups ? "Buscando…" : "Actualizar"}</button>
+                </div>
+              )}
+              {groupsError && destinationKind === "group" && <p className="name-recorder-hint">{groupsError}</p>}
               <button type="submit">Guardar cambios</button>
               <button className="cancel-add-person" type="button" onClick={closeRecipientEditor}>Cancelar</button>
+              {editingRecipient && (
+                <div className="slot-mover">
+                  <span>Botón de la caja</span>
+                  <div className="slot-mover-buttons">
+                    {Array.from({ length: 4 }, (_, slot) => {
+                      const occupant = settings?.recipients[slot];
+                      const isCurrent = occupant?.id === editingRecipient.id;
+                      return (
+                        <button
+                          key={slot}
+                          type="button"
+                          className={isCurrent ? "is-current" : ""}
+                          disabled={isCurrent}
+                          title={isCurrent ? "Botón actual" : occupant ? `Intercambiar con ${occupant.label}` : "Mover a este botón"}
+                          onClick={() => void moveRecipientToSlot(editingRecipient.id, slot)}
+                        >
+                          <i>{slot + 1}</i>
+                          <small>{isCurrent ? "actual" : occupant ? `↔ ${occupant.label}` : "libre"}</small>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+              {editingRecipient ? (
+                <NameRecorder
+                  recipientId={editingRecipient.id}
+                  label={editingRecipient.label}
+                  nameSource={editingRecipient.nameSource ?? "generated"}
+                  onChange={() => void loadSettings()}
+                />
+              ) : (
+                <p className="name-recorder-hint">Guardá el contacto y después grabá cómo lo nombra Chapu.</p>
+              )}
             </form>
           )}
         </div>

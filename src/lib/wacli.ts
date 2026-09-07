@@ -11,6 +11,7 @@ const temporaryAudioDirectory = path.join(process.cwd(), "data", "whatsapp-temp"
 type AuthRuntime = {
   process: ChildProcess | null;
   syncProcess: ChildProcess | null;
+  syncPaused: boolean; // true while a command that needs the store lock runs
   syncError: string | null;
   syncStderrBuffer: string;
   qr: string | null;
@@ -23,6 +24,7 @@ const globalRuntime = globalThis as typeof globalThis & { __messageBoxWacli?: Au
 const authRuntime = globalRuntime.__messageBoxWacli ?? {
   process: null,
   syncProcess: null,
+  syncPaused: false,
   syncError: null,
   syncStderrBuffer: "",
   qr: null,
@@ -31,6 +33,7 @@ const authRuntime = globalRuntime.__messageBoxWacli ?? {
   stderrBuffer: "",
 };
 authRuntime.syncProcess ??= null;
+authRuntime.syncPaused ??= false;
 authRuntime.syncError ??= null;
 authRuntime.syncStderrBuffer ??= "";
 globalRuntime.__messageBoxWacli = authRuntime;
@@ -109,8 +112,18 @@ export async function getWacliAuthStatus(): Promise<WacliAuthStatus> {
   }
 }
 
+// Cheap "can Chapu send and receive right now" check for the device heartbeat,
+// which arrives every second and must not spawn a wacli process each time.
+let readinessCache = { checkedAt: 0, ready: false };
+export async function isWhatsappReady() {
+  if (Date.now() - readinessCache.checkedAt < 5000) return readinessCache.ready;
+  const status = await getWacliAuthStatus();
+  readinessCache = { checkedAt: Date.now(), ready: status.authenticated && status.syncRunning };
+  return readinessCache.ready;
+}
+
 export async function ensureWacliSync(webhookOrigin: string) {
-  if (authRuntime.syncProcess) return;
+  if (authRuntime.syncProcess || authRuntime.syncPaused) return;
   const status = await getWacliAuthStatus();
   if (!status.authenticated) return;
 
@@ -219,6 +232,67 @@ export async function startWacliAuth() {
     }
   });
   return getWacliAuthStatus();
+}
+
+async function stopWacliSync() {
+  const child = authRuntime.syncProcess;
+  if (!child) return;
+  authRuntime.syncProcess = null;
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, 5000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+export type WacliGroup = { jid: string; name: string; joined: boolean };
+
+function parseGroupsList(stdout: string): WacliGroup[] {
+  const envelope = JSON.parse(stdout) as { data?: Array<{ JID?: string; Name?: string; LeftAt?: string }> | null };
+  return (envelope.data ?? [])
+    .filter((group) => typeof group.JID === "string" && group.JID.endsWith("@g.us"))
+    .map((group) => ({
+      jid: group.JID as string,
+      name: group.Name?.trim() ?? "",
+      joined: !group.LeftAt || group.LeftAt.startsWith("0001"),
+    }));
+}
+
+/** Groups the linked number currently belongs to, from the last `groups refresh`. */
+export async function listWacliGroups(): Promise<WacliGroup[]> {
+  const { stdout } = await execFileAsync("wacli", [
+    "--store", wacliStoreDirectory, "--read-only", "--json", "groups", "list",
+  ], { timeout: 10000, maxBuffer: 4 * 1024 * 1024 });
+  return parseGroupsList(stdout)
+    .filter((group) => group.joined)
+    .sort((a, b) => (a.name || "\uffff").localeCompare(b.name || "\uffff", "es"));
+}
+
+/**
+ * Pulls the live group list from WhatsApp. `groups refresh` needs the store
+ * lock that `sync --follow` holds, so the listener is paused for a couple of
+ * seconds and restarted right after; WhatsApp redelivers anything missed.
+ */
+export async function refreshWacliGroups(webhookOrigin: string) {
+  await appendEvent("whatsapp", "Escucha pausada un momento para actualizar la lista de grupos");
+  authRuntime.syncPaused = true; // keeps the status poll from relaunching the listener meanwhile
+  try {
+    await stopWacliSync();
+    await execFileAsync("wacli", [
+      "--store", wacliStoreDirectory,
+      "--json",
+      "--lock-wait", "10s",
+      "groups", "refresh",
+    ], { timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
+  } finally {
+    authRuntime.syncPaused = false;
+    await ensureWacliSync(webhookOrigin);
+  }
+  return listWacliGroups();
 }
 
 export async function logoutWacli() {
