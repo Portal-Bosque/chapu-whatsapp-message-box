@@ -6,3 +6,4 @@
 #define MESSAGE_BOX_OUTBOX_URL "http://YOUR_MAC_IP:3000/api/outbox"
 #define MESSAGE_BOX_RECORD_COMMAND_URL "http://YOUR_MAC_IP:3000/api/device/record"
 #define MESSAGE_BOX_DEVICE_STATUS_URL "http://YOUR_MAC_IP:3000/api/device/status"
+#define MESSAGE_BOX_DEVICE_NAMES_URL "http://YOUR_MAC_IP:3000/api/device/names"

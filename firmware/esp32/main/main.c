@@ -26,17 +26,84 @@
 #include "nvs_flash.h"
 #include "usb/usb_host.h"
 #include "usb/uac_host.h"
+#include "cJSON.h"
 #include "wifi_secrets.h"
 
 static const char *TAG = "usb_audio_player";
 static bool s_wifi_ready = false;
 
 #define MIC_RECORD_MAX_SECONDS 120
-#define RECORD_BUTTON_GPIO GPIO_NUM_4
-#define RECORD_LED_GPIO GPIO_NUM_5
-#define RECORD_BUTTON_DEBOUNCE_MS 50
-#define RECORD_LED_BLINK_MS 350
+#define BUTTON_DEBOUNCE_MS 50
+#define LED_BLINK_MS 350
 #define RECORDING_CHIME_SETTLE_MS 350
+#define STATUS_HEARTBEAT_MS 1000
+
+// Front panel: every EG STARTS button has a microswitch (COM to GND, NO to the
+// button GPIO, so a press reads LOW) and a lamp driven through a MOSFET or
+// ULN2003 channel (GPIO HIGH turns the lamp on). Each button/lamp pair sits on
+// two adjacent header pins so the wiring stays readable.
+#define AGENDA_SLOTS 4
+#define BUTTON_COUNT (2 + AGENDA_SLOTS)
+#define BUTTON_SEND 0
+#define BUTTON_LISTEN 1
+#define BUTTON_AGENDA_FIRST 2
+
+static const gpio_num_t s_button_gpios[BUTTON_COUNT] = {
+    GPIO_NUM_4,   // Mandar
+    GPIO_NUM_6,   // Recibir
+    GPIO_NUM_15,  // Agenda 1
+    GPIO_NUM_17,  // Agenda 2
+    GPIO_NUM_10,  // Agenda 3
+    GPIO_NUM_12,  // Agenda 4
+};
+
+static const gpio_num_t s_led_gpios[BUTTON_COUNT] = {
+    GPIO_NUM_5,   // Mandar
+    GPIO_NUM_7,   // Recibir
+    GPIO_NUM_16,  // Agenda 1
+    GPIO_NUM_18,  // Agenda 2
+    GPIO_NUM_11,  // Agenda 3
+    GPIO_NUM_13,  // Agenda 4
+};
+
+static const char *s_button_names[BUTTON_COUNT] = {
+    "send", "listen", "agenda 1", "agenda 2", "agenda 3", "agenda 4",
+};
+
+typedef enum {
+    LED_OFF = 0,
+    LED_ON,
+    LED_BLINK,
+} led_mode_t;
+
+// State mirrored from the web application through the heartbeat response.
+static volatile int s_selected_slot = -1;        // agenda slot the web will send to
+static volatile int s_pending_slot_press = -1;   // agenda press not yet confirmed by the web
+static volatile bool s_slot_configured[AGENDA_SLOTS] = {false};
+static volatile int s_queued_messages = 0;       // WhatsApp notes waiting for the listen button
+static volatile bool s_listen_requested = false;
+static volatile bool s_status_dirty = false;
+
+// Spoken contact names, one per agenda slot, downloaded from the web and kept
+// in PSRAM so a press answers immediately. The web reports a version string per
+// slot in every heartbeat; a mismatch triggers a refresh.
+#define NAME_CLIP_MAX_BYTES (256 * 1024)
+typedef struct {
+    char version[32];   // version the web reports ("" = no clip available)
+    char loaded[32];    // version currently cached ("" = nothing cached)
+    uint8_t *wav;       // full WAV file in PSRAM
+    const uint8_t *pcm; // PCM16 mono 16 kHz inside `wav`
+    size_t pcm_size;
+} slot_name_t;
+static slot_name_t s_slot_names[AGENDA_SLOTS];
+
+// Boot greeting, spoken once per boot when Chapu can send and receive.
+static volatile bool s_whatsapp_ready = false;
+static volatile bool s_name_playing = false; // a spoken name / greeting / chime is on the speaker
+static bool s_greeting_played = false;
+static uint8_t *s_greeting_wav = NULL;
+static const uint8_t *s_greeting_pcm = NULL;
+static size_t s_greeting_pcm_size = 0;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -160,6 +227,7 @@ static TaskHandle_t s_play_task_handle = NULL;
 static uint8_t *s_remote_wav_buf = NULL;
 static char s_remote_message_id[96] = {0};
 static volatile bool s_remote_playing = false;
+static volatile bool s_remote_is_notification = false; // short "new message" voice cue
 static volatile bool s_remote_playback_finished = false;
 static volatile bool s_emeet_cycle_active = false;
 static volatile bool s_recording_indicator = false;
@@ -175,6 +243,8 @@ static int16_t *s_start_chime_pcm = NULL;
 static size_t s_start_chime_pcm_size = 0;
 static int16_t *s_stop_chime_pcm = NULL;
 static size_t s_stop_chime_pcm_size = 0;
+static int16_t *s_agenda_chime_pcm = NULL;   // short blip confirming an agenda press
+static size_t s_agenda_chime_pcm_size = 0;
 #ifndef CONFIG_EXAMPLE_MIC_PLAYBACK
 extern const uint8_t message_box_test_pcm[];
 extern const unsigned int message_box_test_pcm_len;
@@ -196,11 +266,19 @@ static void play_captured_recording(void);
 static void recording_playback_done_cb(void);
 static void remote_playback_done_cb(void);
 static bool ensure_mic_record_buffer(void);
+static esp_err_t start_pcm_playback(player_config_t *config);
 
-static void record_button_gpio_init(void)
+static void panel_gpio_init(void)
 {
+    uint64_t button_mask = 0;
+    uint64_t led_mask = 0;
+    for (int i = 0; i < BUTTON_COUNT; i++) {
+        button_mask |= 1ULL << s_button_gpios[i];
+        led_mask |= 1ULL << s_led_gpios[i];
+    }
+
     gpio_config_t button_config = {
-        .pin_bit_mask = 1ULL << RECORD_BUTTON_GPIO,
+        .pin_bit_mask = button_mask,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -209,76 +287,209 @@ static void record_button_gpio_init(void)
     ESP_ERROR_CHECK(gpio_config(&button_config));
 
     gpio_config_t led_config = {
-        .pin_bit_mask = 1ULL << RECORD_LED_GPIO,
+        .pin_bit_mask = led_mask,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&led_config));
-    ESP_ERROR_CHECK(gpio_set_level(RECORD_LED_GPIO, 0));
+    for (int i = 0; i < BUTTON_COUNT; i++) {
+        ESP_ERROR_CHECK(gpio_set_level(s_led_gpios[i], 0));
+    }
 }
 
-static void record_button_task(void *arg)
+static void handle_send_button(void)
 {
-    int raw_level = gpio_get_level(RECORD_BUTTON_GPIO);
-    int stable_level = raw_level;
-    TickType_t level_changed_at = xTaskGetTickCount();
-    TickType_t next_led_toggle = level_changed_at;
-    bool led_on = false;
-    bool indicator_was_active = false;
+    if (!s_emeet_cycle_active) {
+        if (s_spk_dev_handle == NULL || s_mic_dev_handle == NULL) {
+            ESP_LOGW(TAG, "Send button ignored: EMEET is not ready");
+        } else if (s_play_task_handle != NULL || s_remote_playing) {
+            ESP_LOGW(TAG, "Send button ignored: audio playback is active");
+        } else if (!ensure_mic_record_buffer()) {
+            ESP_LOGE(TAG, "Send button could not allocate the recording buffer");
+        } else {
+            ESP_LOGI(TAG, "Send button: start recording");
+            s_emeet_cycle_active = true;
+            start_recording_cycle();
+        }
+    } else if (s_mic_recording) {
+        ESP_LOGI(TAG, "Send button: stop recording and send");
+        stop_recording_cycle();
+    } else {
+        ESP_LOGW(TAG, "Send button ignored: message cycle is busy");
+    }
+}
+
+static void handle_listen_button(void)
+{
+    if (s_remote_playing || s_play_task_handle != NULL) {
+        ESP_LOGW(TAG, "Listen button ignored: audio playback is active");
+    } else if (s_emeet_cycle_active) {
+        ESP_LOGW(TAG, "Listen button ignored: a recording is in progress");
+    } else if (!s_wifi_ready) {
+        ESP_LOGW(TAG, "Listen button ignored: Wi-Fi is not ready");
+    } else {
+        // With nothing queued the web replays the last received note.
+        ESP_LOGI(TAG, "Listen button: asking the web for the next message (%d queued)", s_queued_messages);
+        s_listen_requested = true;
+    }
+}
+
+static void name_playback_done_cb(void)
+{
+    s_name_playing = false;
+}
+
+// Names, chimes and the greeting are short cues: a new press cuts the one that
+// is still sounding instead of being ignored. Returns true once the speaker is
+// free for the next cue.
+static bool make_room_for_cue(void)
+{
+    if (s_remote_playing || s_emeet_cycle_active) {
+        return false; // never talk over a WhatsApp note or a recording
+    }
+    if (s_play_task_handle == NULL) {
+        return true;
+    }
+    if (!s_name_playing) {
+        return false;
+    }
+    s_stop_play_request = true;
+    for (int i = 0; i < 50 && s_play_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    s_stop_play_request = false;
+    return s_play_task_handle == NULL;
+}
+
+static void play_agenda_chime(void)
+{
+    if (s_spk_dev_handle == NULL || s_agenda_chime_pcm == NULL) {
+        return;
+    }
+    if (!make_room_for_cue()) {
+        ESP_LOGI(TAG, "Agenda chime skipped: audio is busy");
+        return;
+    }
+    player_config_t blip = {
+        .pcm_ptr = (const uint8_t *)s_agenda_chime_pcm,
+        .pcm_size = s_agenda_chime_pcm_size,
+        .complete_cb = name_playback_done_cb,
+    };
+    s_name_playing = true;
+    if (start_pcm_playback(&blip) != ESP_OK) {
+        s_name_playing = false;
+    }
+}
+
+static void play_slot_name_or_chime(int slot)
+{
+    const slot_name_t *name = &s_slot_names[slot];
+    if (name->pcm == NULL) {
+        play_agenda_chime();
+        return;
+    }
+    if (s_spk_dev_handle == NULL) {
+        return;
+    }
+    if (!make_room_for_cue()) {
+        ESP_LOGI(TAG, "Name playback skipped: audio is busy");
+        return;
+    }
+    player_config_t clip = {
+        .pcm_ptr = name->pcm,
+        .pcm_size = name->pcm_size,
+        .convert_mono_16k_to_stereo_48k = true,
+        .complete_cb = name_playback_done_cb,
+    };
+    s_name_playing = true;
+    if (start_pcm_playback(&clip) != ESP_OK) {
+        s_name_playing = false;
+    }
+}
+
+static void handle_agenda_button(int slot)
+{
+    if (!s_slot_configured[slot]) {
+        ESP_LOGW(TAG, "Agenda button %d ignored: no contact configured in the web", slot + 1);
+        return;
+    }
+    ESP_LOGI(TAG, "Agenda button %d pressed", slot + 1);
+    s_selected_slot = slot;
+    s_pending_slot_press = slot;
+    s_status_dirty = true;
+    play_slot_name_or_chime(slot);
+}
+
+static led_mode_t desired_led_mode(int button)
+{
+    switch (button) {
+    case BUTTON_SEND:
+        return s_recording_indicator ? LED_BLINK : LED_OFF;
+    case BUTTON_LISTEN:
+        if (s_remote_playing && !s_remote_is_notification) {
+            return LED_ON;
+        }
+        return s_queued_messages > 0 ? LED_BLINK : LED_OFF;
+    default: {
+        int slot = button - BUTTON_AGENDA_FIRST;
+        return slot == s_selected_slot ? LED_ON : LED_OFF;
+    }
+    }
+}
+
+static void panel_task(void *arg)
+{
+    int raw_level[BUTTON_COUNT];
+    int stable_level[BUTTON_COUNT];
+    TickType_t level_changed_at[BUTTON_COUNT];
+    TickType_t now = xTaskGetTickCount();
+    TickType_t next_blink_toggle = now;
+    bool blink_phase = false;
+
+    for (int i = 0; i < BUTTON_COUNT; i++) {
+        raw_level[i] = gpio_get_level(s_button_gpios[i]);
+        stable_level[i] = raw_level[i];
+        level_changed_at[i] = now;
+    }
 
     while (true) {
-        TickType_t now = xTaskGetTickCount();
-        int new_level = gpio_get_level(RECORD_BUTTON_GPIO);
+        now = xTaskGetTickCount();
 
-        if (new_level != raw_level) {
-            raw_level = new_level;
-            level_changed_at = now;
-        }
-
-        if (raw_level != stable_level &&
-                (now - level_changed_at) >= pdMS_TO_TICKS(RECORD_BUTTON_DEBOUNCE_MS)) {
-            stable_level = raw_level;
-
-            // COM is wired to GND and NO to GPIO4, so a press reads LOW.
-            if (stable_level == 0) {
-                if (!s_emeet_cycle_active) {
-                    if (s_spk_dev_handle == NULL || s_mic_dev_handle == NULL) {
-                        ESP_LOGW(TAG, "Physical button ignored: EMEET is not ready");
-                    } else if (s_play_task_handle != NULL || s_remote_playing) {
-                        ESP_LOGW(TAG, "Physical button ignored: audio playback is active");
-                    } else if (!ensure_mic_record_buffer()) {
-                        ESP_LOGE(TAG, "Physical button could not allocate the recording buffer");
-                    } else {
-                        ESP_LOGI(TAG, "Physical button: start recording");
-                        s_emeet_cycle_active = true;
-                        start_recording_cycle();
-                    }
-                } else if (s_mic_recording) {
-                    ESP_LOGI(TAG, "Physical button: stop recording and send");
-                    stop_recording_cycle();
-                } else {
-                    ESP_LOGW(TAG, "Physical button ignored: message cycle is busy");
-                }
+        for (int i = 0; i < BUTTON_COUNT; i++) {
+            int new_level = gpio_get_level(s_button_gpios[i]);
+            if (new_level != raw_level[i]) {
+                raw_level[i] = new_level;
+                level_changed_at[i] = now;
+            }
+            if (raw_level[i] == stable_level[i] ||
+                    (now - level_changed_at[i]) < pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
+                continue;
+            }
+            stable_level[i] = raw_level[i];
+            if (stable_level[i] != 0) {
+                continue; // release
+            }
+            ESP_LOGD(TAG, "Button %s pressed", s_button_names[i]);
+            if (i == BUTTON_SEND) {
+                handle_send_button();
+            } else if (i == BUTTON_LISTEN) {
+                handle_listen_button();
+            } else {
+                handle_agenda_button(i - BUTTON_AGENDA_FIRST);
             }
         }
 
-        if (s_recording_indicator) {
-            if (!indicator_was_active) {
-                led_on = true;
-                gpio_set_level(RECORD_LED_GPIO, 1);
-                next_led_toggle = now + pdMS_TO_TICKS(RECORD_LED_BLINK_MS);
-            } else if ((int32_t)(now - next_led_toggle) >= 0) {
-                led_on = !led_on;
-                gpio_set_level(RECORD_LED_GPIO, led_on ? 1 : 0);
-                next_led_toggle = now + pdMS_TO_TICKS(RECORD_LED_BLINK_MS);
-            }
-        } else if (led_on || indicator_was_active) {
-            led_on = false;
-            gpio_set_level(RECORD_LED_GPIO, 0);
+        if ((int32_t)(now - next_blink_toggle) >= 0) {
+            blink_phase = !blink_phase;
+            next_blink_toggle = now + pdMS_TO_TICKS(LED_BLINK_MS);
         }
-        indicator_was_active = s_recording_indicator;
+        for (int i = 0; i < BUTTON_COUNT; i++) {
+            led_mode_t mode = desired_led_mode(i);
+            int level = mode == LED_ON ? 1 : mode == LED_BLINK ? (blink_phase ? 1 : 0) : 0;
+            gpio_set_level(s_led_gpios[i], level);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -412,6 +623,19 @@ static void fill_playful_chime(int16_t *pcm, uint32_t sample_rate, float first_h
     }
 }
 
+static void fill_blip(int16_t *pcm, uint32_t sample_rate, float hz, uint32_t duration_ms)
+{
+    const uint32_t frames = sample_rate * duration_ms / 1000;
+    for (uint32_t frame = 0; frame < frames; frame++) {
+        float progress = (float)frame / (float)frames;
+        float envelope = sinf(3.14159265f * progress);
+        float phase = 2.0f * 3.14159265f * hz * frame / sample_rate;
+        int16_t sample = (int16_t)(6000.0f * envelope * (sinf(phase) + 0.15f * sinf(phase * 2.0f)));
+        pcm[frame * 2] = sample;
+        pcm[frame * 2 + 1] = sample;
+    }
+}
+
 static void prepare_recording_chimes(void)
 {
     const uint32_t sample_rate = 48000;
@@ -428,6 +652,13 @@ static void prepare_recording_chimes(void)
     // Start goes up (E5 -> B5); stop answers by going down.
     fill_playful_chime(s_start_chime_pcm, sample_rate, 659.25f, 987.77f);
     fill_playful_chime(s_stop_chime_pcm, sample_rate, 987.77f, 659.25f);
+
+    // Agenda: one short C6 blip, clearly different from the record chimes.
+    const uint32_t blip_ms = 110;
+    s_agenda_chime_pcm_size = (sample_rate * blip_ms / 1000) * 2 * sizeof(int16_t);
+    s_agenda_chime_pcm = malloc(s_agenda_chime_pcm_size);
+    assert(s_agenda_chime_pcm != NULL);
+    fill_blip(s_agenda_chime_pcm, sample_rate, 1046.50f, blip_ms);
 }
 
 static void start_recording_cycle(void)
@@ -757,6 +988,7 @@ static esp_err_t fetch_and_play_remote_message(void)
 
     s_remote_wav_buf = buffer;
     strlcpy(s_remote_message_id, context.message_id, sizeof(s_remote_message_id));
+    s_remote_is_notification = strncmp(s_remote_message_id, "notify_", 7) == 0;
     s_remote_playing = true;
     player_config_t playback = {
         .pcm_ptr = pcm,
@@ -782,15 +1014,69 @@ static void remote_playback_done_cb(void)
     s_remote_playback_finished = true;
 }
 
+static void apply_panel_state(const char *json, size_t json_size)
+{
+    cJSON *root = cJSON_ParseWithLength(json, json_size);
+    if (root == NULL) {
+        ESP_LOGW(TAG, "Heartbeat response is not JSON");
+        return;
+    }
+
+    const cJSON *selected = cJSON_GetObjectItemCaseSensitive(root, "selectedSlot");
+    const cJSON *slots = cJSON_GetObjectItemCaseSensitive(root, "slots");
+    const cJSON *queued = cJSON_GetObjectItemCaseSensitive(root, "queued");
+
+    if (cJSON_IsArray(slots)) {
+        for (int i = 0; i < AGENDA_SLOTS; i++) {
+            const cJSON *slot = cJSON_GetArrayItem(slots, i);
+            s_slot_configured[i] = cJSON_IsTrue(slot);
+        }
+    }
+    if (cJSON_IsNumber(queued)) {
+        s_queued_messages = queued->valueint;
+    }
+    const cJSON *whatsapp_ready = cJSON_GetObjectItemCaseSensitive(root, "whatsappReady");
+    if (cJSON_IsBool(whatsapp_ready)) {
+        s_whatsapp_ready = cJSON_IsTrue(whatsapp_ready);
+    }
+    const cJSON *names = cJSON_GetObjectItemCaseSensitive(root, "names");
+    if (cJSON_IsArray(names)) {
+        for (int i = 0; i < AGENDA_SLOTS; i++) {
+            const cJSON *name = cJSON_GetArrayItem(names, i);
+            const char *version = cJSON_IsString(name) ? name->valuestring : "";
+            strlcpy(s_slot_names[i].version, version, sizeof(s_slot_names[i].version));
+        }
+    }
+    // Only adopt the web's selection when no newer physical press is waiting;
+    // otherwise the lamp would flicker back until the next heartbeat.
+    if (s_pending_slot_press < 0) {
+        int previous = s_selected_slot;
+        s_selected_slot = cJSON_IsNumber(selected) ? selected->valueint : -1;
+        if (s_selected_slot != previous) {
+            ESP_LOGI(TAG, "Web selected agenda slot %d", s_selected_slot + 1);
+        }
+    }
+    cJSON_Delete(root);
+}
+
 static esp_err_t publish_device_status(void)
 {
-    char payload[112];
+    const int pressed_slot = s_pending_slot_press;
+    char payload[160];
     int payload_size = snprintf(payload, sizeof(payload),
-                                "{\"speaker\":%s,\"microphone\":%s,\"recording\":%s}",
+                                "{\"speaker\":%s,\"microphone\":%s,\"recording\":%s,\"playing\":%s",
                                 s_spk_dev_handle != NULL ? "true" : "false",
                                 s_mic_dev_handle != NULL ? "true" : "false",
-                                s_mic_recording ? "true" : "false");
-    if (payload_size <= 0 || payload_size >= sizeof(payload)) {
+                                s_mic_recording ? "true" : "false",
+                                s_remote_playing ? "true" : "false");
+    if (payload_size > 0 && payload_size < (int)sizeof(payload) && pressed_slot >= 0) {
+        payload_size += snprintf(payload + payload_size, sizeof(payload) - payload_size,
+                                 ",\"selectedSlot\":%d", pressed_slot);
+    }
+    if (payload_size > 0 && payload_size < (int)sizeof(payload)) {
+        payload_size += snprintf(payload + payload_size, sizeof(payload) - payload_size, "}");
+    }
+    if (payload_size <= 0 || payload_size >= (int)sizeof(payload)) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -804,14 +1090,234 @@ static esp_err_t publish_device_status(void)
         return ESP_FAIL;
     }
     esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, payload, payload_size);
+    esp_http_client_set_header(client, "X-Device-ID", "message-box-esp32");
+
+    esp_err_t result = esp_http_client_open(client, payload_size);
+    if (result == ESP_OK && esp_http_client_write(client, payload, payload_size) != payload_size) {
+        result = ESP_FAIL;
+    }
+    int status = 0;
+    char response[512];
+    int response_size = 0;
+    if (result == ESP_OK) {
+        if (esp_http_client_fetch_headers(client) < 0) {
+            result = ESP_FAIL;
+        } else {
+            status = esp_http_client_get_status_code(client);
+            response_size = esp_http_client_read_response(client, response, sizeof(response) - 1);
+        }
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (status < 200 || status >= 300) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (pressed_slot >= 0 && s_pending_slot_press == pressed_slot) {
+        s_pending_slot_press = -1;
+    }
+    if (response_size > 0) {
+        apply_panel_state(response, (size_t)response_size);
+    }
+    return ESP_OK;
+}
+
+static void drop_slot_name(int slot)
+{
+    slot_name_t *name = &s_slot_names[slot];
+    free(name->wav);
+    name->wav = NULL;
+    name->pcm = NULL;
+    name->pcm_size = 0;
+    name->loaded[0] = '\0';
+}
+
+// Downloads a PCM16 mono/16 kHz WAV clip into PSRAM. Returns ESP_ERR_NOT_FOUND
+// when the web has nothing for it (HTTP 404/204).
+static esp_err_t download_name_clip(const char *path, uint8_t **wav_out, const uint8_t **pcm_out, size_t *pcm_size_out)
+{
+    char url[256];
+    int written = snprintf(url, sizeof(url), "%s/%s", MESSAGE_BOX_DEVICE_NAMES_URL, path);
+    if (written <= 0 || written >= (int)sizeof(url)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 8000,
+        .buffer_size = 2048,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        return ESP_FAIL;
+    }
+    esp_err_t result = esp_http_client_open(client, 0);
+    int64_t content_length = -1;
+    int status = 0;
+    if (result == ESP_OK) {
+        content_length = esp_http_client_fetch_headers(client);
+        status = esp_http_client_get_status_code(client);
+    }
+    if (result == ESP_OK && (status == 404 || status == 204)) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (result != ESP_OK || status != 200 || content_length < (int64_t)sizeof(wav_header_t) ||
+            content_length > NAME_CLIP_MAX_BYTES) {
+        ESP_LOGW(TAG, "Invalid clip response for %s: HTTP %d, length %lld", path, status, content_length);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result;
+    }
+
+    uint8_t *buffer = heap_caps_malloc((size_t)content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buffer == NULL) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
+    }
+    size_t total = 0;
+    while (total < (size_t)content_length) {
+        int received = esp_http_client_read(client, (char *)buffer + total, (int)((size_t)content_length - total));
+        if (received <= 0) {
+            result = ESP_FAIL;
+            break;
+        }
+        total += received;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    const uint8_t *pcm = NULL;
+    size_t pcm_size = 0;
+    if (result != ESP_OK || total != (size_t)content_length || !parse_remote_wave(buffer, total, &pcm, &pcm_size)) {
+        ESP_LOGW(TAG, "Clip %s is not PCM16 mono/16 kHz WAV", path);
+        free(buffer);
+        return result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result;
+    }
+    *wav_out = buffer;
+    *pcm_out = pcm;
+    *pcm_size_out = pcm_size;
+    return ESP_OK;
+}
+
+static esp_err_t fetch_slot_name(int slot)
+{
+    slot_name_t *name = &s_slot_names[slot];
+    char wanted[sizeof(name->version)];
+    strlcpy(wanted, name->version, sizeof(wanted));
+    if (wanted[0] == '\0') {
+        drop_slot_name(slot);
+        return ESP_OK;
+    }
+
+    char path[8];
+    snprintf(path, sizeof(path), "%d", slot);
+    uint8_t *wav = NULL;
+    const uint8_t *pcm = NULL;
+    size_t pcm_size = 0;
+    esp_err_t result = download_name_clip(path, &wav, &pcm, &pcm_size);
+    if (result == ESP_ERR_NOT_FOUND) {
+        drop_slot_name(slot);
+        // Remember that this version has nothing to play so we stop asking.
+        strlcpy(name->loaded, wanted, sizeof(name->loaded));
+        ESP_LOGI(TAG, "Agenda slot %d has no spoken name; using the chime", slot + 1);
+        return ESP_OK;
+    }
+    if (result != ESP_OK) {
+        return result;
+    }
+
+    drop_slot_name(slot);
+    name->wav = wav;
+    name->pcm = pcm;
+    name->pcm_size = pcm_size;
+    strlcpy(name->loaded, wanted, sizeof(name->loaded));
+    ESP_LOGI(TAG, "Spoken name for agenda slot %d cached (%u PCM bytes)", slot + 1, (unsigned)pcm_size);
+    return ESP_OK;
+}
+
+static bool play_boot_greeting(void)
+{
+    if (s_greeting_wav == NULL) {
+        esp_err_t result = download_name_clip("greeting", &s_greeting_wav, &s_greeting_pcm, &s_greeting_pcm_size);
+        if (result == ESP_ERR_NOT_FOUND) {
+            ESP_LOGI(TAG, "No boot greeting configured");
+            return true; // nothing to say; consider it done
+        }
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Could not fetch the boot greeting: %s", esp_err_to_name(result));
+            return false;
+        }
+    }
+    player_config_t clip = {
+        .pcm_ptr = s_greeting_pcm,
+        .pcm_size = s_greeting_pcm_size,
+        .convert_mono_16k_to_stereo_48k = true,
+        .complete_cb = name_playback_done_cb,
+    };
+    s_name_playing = true;
+    if (start_pcm_playback(&clip) != ESP_OK) {
+        s_name_playing = false;
+        return false;
+    }
+    ESP_LOGI(TAG, "Chapu is ready: playing the boot greeting");
+    return true;
+}
+
+static int slot_name_needing_sync(void)
+{
+    for (int i = 0; i < AGENDA_SLOTS; i++) {
+        if (strcmp(s_slot_names[i].version, s_slot_names[i].loaded) != 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static esp_err_t release_next_message(void)
+{
+    char url[256];
+    int written = snprintf(url, sizeof(url), "%s/release", MESSAGE_BOX_OUTBOX_URL);
+    if (written <= 0 || written >= (int)sizeof(url)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 5000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        return ESP_FAIL;
+    }
+    esp_http_client_set_header(client, "X-Device-ID", "message-box-esp32");
+    esp_http_client_set_post_field(client, "", 0);
     esp_err_t result = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
     if (result != ESP_OK) {
         return result;
     }
-    return status >= 200 && status < 300 ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+    if (status == 404) {
+        ESP_LOGI(TAG, "Nothing to play: no queued or previously received message");
+        s_queued_messages = 0;
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (status == 409) {
+        ESP_LOGW(TAG, "The web reports another message is still playing");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (status < 200 || status >= 300) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    ESP_LOGI(TAG, "Next message released; it will be downloaded on the next poll");
+    return ESP_OK;
 }
 
 static void remote_messages_task(void *arg)
@@ -819,9 +1325,20 @@ static void remote_messages_task(void *arg)
     TickType_t last_status_at = 0;
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        if (s_wifi_ready && (now - last_status_at >= pdMS_TO_TICKS(2000))) {
-            publish_device_status();
+        if (s_wifi_ready && (s_status_dirty || now - last_status_at >= pdMS_TO_TICKS(STATUS_HEARTBEAT_MS))) {
+            s_status_dirty = false;
+            esp_err_t status_result = publish_device_status();
+            if (status_result != ESP_OK) {
+                ESP_LOGW(TAG, "Heartbeat failed: %s", esp_err_to_name(status_result));
+            }
             last_status_at = now;
+        }
+        if (s_wifi_ready && s_listen_requested) {
+            s_listen_requested = false;
+            esp_err_t release_result = release_next_message();
+            if (release_result == ESP_OK) {
+                s_status_dirty = true;
+            }
         }
         if (s_remote_playback_finished) {
             if (acknowledge_remote_message() == ESP_OK) {
@@ -834,6 +1351,23 @@ static void remote_messages_task(void *arg)
             }
         } else if (s_wifi_ready && s_spk_dev_handle != NULL && !s_remote_playing &&
                    s_play_task_handle == NULL) {
+            if (!s_greeting_played && s_whatsapp_ready && s_mic_dev_handle != NULL && !s_emeet_cycle_active) {
+                s_greeting_played = play_boot_greeting();
+                if (s_greeting_played) {
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue; // let the greeting start before polling for more audio
+                }
+                vTaskDelay(pdMS_TO_TICKS(3000)); // retry a bit later
+            }
+            int stale_slot = slot_name_needing_sync();
+            if (stale_slot >= 0 && !s_emeet_cycle_active) {
+                esp_err_t name_result = fetch_slot_name(stale_slot);
+                if (name_result != ESP_OK) {
+                    ESP_LOGW(TAG, "Could not fetch the name for slot %d: %s", stale_slot + 1, esp_err_to_name(name_result));
+                    // Avoid hammering the web: retry on the next heartbeat cycle.
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                }
+            }
             esp_err_t command_result = fetch_record_command();
             if (command_result == ESP_ERR_NOT_FOUND && !s_emeet_cycle_active) {
                 esp_err_t result = fetch_and_play_remote_message();
@@ -1246,7 +1780,7 @@ static void uac_lib_task(void *arg)
 
 void app_main(void)
 {
-    record_button_gpio_init();
+    panel_gpio_init();
     wifi_init_sta();
     prepare_recording_chimes();
     s_event_queue = xQueueCreate(10, sizeof(s_event_queue_t));
@@ -1259,10 +1793,10 @@ void app_main(void)
     ret = xTaskCreatePinnedToCore(usb_lib_task, "usb_events", 4096, (void *)uac_task_handle,
                                   USB_HOST_TASK_PRIORITY, NULL, 0);
     assert(ret == pdTRUE);
-    ret = xTaskCreatePinnedToCore(remote_messages_task, "remote_messages", 6144, NULL,
+    ret = xTaskCreatePinnedToCore(remote_messages_task, "remote_messages", 8192, NULL,
                                   USER_TASK_PRIORITY, NULL, 1);
     assert(ret == pdTRUE);
-    ret = xTaskCreatePinnedToCore(record_button_task, "record_button", 3072, NULL,
+    ret = xTaskCreatePinnedToCore(panel_task, "panel", 4096, NULL,
                                   USER_TASK_PRIORITY, NULL, 1);
     assert(ret == pdTRUE);
 }
