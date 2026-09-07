@@ -14,7 +14,7 @@ SSH="ssh -i $KEY -o BatchMode=yes"
 rsync -az --delete -e "$SSH" \
   --exclude node_modules --exclude .next --exclude data --exclude .git \
   --exclude 'firmware/esp32/.pio' --exclude 'firmware/esp32/build' \
-  --exclude 'firmware/esp32/managed_components' --exclude .DS_Store \
+  --exclude 'firmware/esp32/managed_components' --exclude 'firmware/esp32/bins' --exclude .DS_Store \
   ./ "$HOST:~/$REMOTE_DIR/"
 
 $SSH "$HOST" "export PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH; cd ~/$REMOTE_DIR \
