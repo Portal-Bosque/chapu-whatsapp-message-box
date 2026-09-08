@@ -50,3 +50,35 @@ export async function listOutboxMessages() {
 
   return [...queued, ...pending, ...played].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
+
+/**
+ * The WhatsApp note the listen button would play next: the oldest queued one,
+ * or the last one heard when nothing new is waiting (the button replays it).
+ * The ESP32 downloads it ahead of time so a press starts playing at once.
+ */
+export async function nextMessageForDevice() {
+  const notes = (await listOutboxMessages())
+    .filter((message) => message.id.startsWith("wa_"))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const queued = notes.find((message) => message.status === "queued");
+  if (queued) return queued.id;
+  // The note on the speaker becomes the replay target the moment it ends, so
+  // naming it now lets the ESP32 keep it instead of re-downloading it.
+  const pending = notes.find((message) => message.status === "pending");
+  if (pending) return pending.id;
+  const played = notes.filter((message) => message.status === "played");
+  return played.length > 0 ? played[played.length - 1].id : null;
+}
+
+export async function findOutboxWave(id: string) {
+  for (const directory of [queuedDirectory, pendingDirectory, playedDirectory]) {
+    const filePath = path.join(directory, `${id}.wav`);
+    try {
+      await fs.access(filePath);
+      return filePath;
+    } catch {
+      // Not here; try the next stage.
+    }
+  }
+  return null;
+}

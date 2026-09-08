@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { appendEvent } from "@/lib/events";
 import { isDeviceOnline } from "@/lib/device";
+import { incomingDirectory, type IncomingMarker } from "@/lib/incoming";
 import { isNotificationId, queueNewMessageNotification, type NotificationSender } from "@/lib/notifications";
 import { ensureOutboxDirectories, pendingDirectory, queuedDirectory } from "@/lib/outbox";
 
@@ -10,17 +11,6 @@ import { ensureOutboxDirectories, pendingDirectory, queuedDirectory } from "@/li
 export const REMINDER_OFFSETS_MS = [60_000, 10 * 60_000, 60 * 60_000];
 export const REMINDER_WINDOW = { startHour: 7, endHour: 21 };
 const TICK_MS = 30_000;
-
-const incomingDirectory = path.join(process.cwd(), "data", "whatsapp-incoming");
-
-type IncomingMarker = {
-  status?: string;
-  senderId?: string | null;
-  senderLabel?: string;
-  queuedAt?: string;
-  remindersSent?: number;
-  lastCueAt?: string;
-};
 
 type UnheardMessage = {
   id: string;

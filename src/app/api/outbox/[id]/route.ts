@@ -1,12 +1,35 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { NextResponse } from "next/server";
-import { ensureOutboxDirectories, pendingDirectory, playedDirectory, safeOutboxId, servedDirectory } from "@/lib/outbox";
+import { ensureOutboxDirectories, findOutboxWave, pendingDirectory, playedDirectory, safeOutboxId, servedDirectory } from "@/lib/outbox";
 import { appendEvent } from "@/lib/events";
 import { isNotificationId } from "@/lib/notifications";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+// Read-only download used by the ESP32 to prefetch the next note into PSRAM;
+// the queue only moves when the listen button releases it.
+export async function GET(_request: Request, context: { params: Promise<{ id: string }> }) {
+  const { id } = await context.params;
+  if (!safeOutboxId(id)) {
+    return NextResponse.json({ error: "ID inválido" }, { status: 400 });
+  }
+  const filePath = await findOutboxWave(id);
+  if (!filePath) {
+    return NextResponse.json({ error: "Mensaje no encontrado" }, { status: 404 });
+  }
+  const buffer = await fs.readFile(filePath);
+  await appendEvent("device", "ESP32 precargó el próximo mensaje para reproducirlo al instante");
+  return new Response(buffer, {
+    headers: {
+      "Content-Type": "audio/wav",
+      "Content-Length": String(buffer.length),
+      "X-Message-ID": id,
+      "Cache-Control": "no-store",
+    },
+  });
+}
 
 export async function DELETE(_request: Request, context: { params: Promise<{ id: string }> }) {
   const { id } = await context.params;

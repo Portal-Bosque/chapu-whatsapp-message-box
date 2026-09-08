@@ -4,6 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { NextResponse } from "next/server";
 import { appendEvent } from "@/lib/events";
+import { incomingDirectory, selectSenderRecipient } from "@/lib/incoming";
 import { sendReminderCue } from "@/lib/reminders";
 import { ensureOutboxDirectories, queuedDirectory } from "@/lib/outbox";
 import { isGroupDestination, readSettings } from "@/lib/settings";
@@ -13,7 +14,6 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const execFileAsync = promisify(execFile);
-const incomingDirectory = path.join(process.cwd(), "data", "whatsapp-incoming");
 
 type IncomingMessage = {
   Chat?: string;
@@ -70,6 +70,8 @@ async function processIncomingAudio(message: Required<Pick<IncomingMessage, "Cha
       queuedAt: new Date().toISOString(),
     }, null, 2));
     await appendEvent("device", `Nota de voz de ${senderLabel} guardada en la cola de Chapu`);
+    // Aim the agenda at whoever wrote, so the send button answers them.
+    await selectSenderRecipient(sender?.id, `Mensaje de ${senderLabel}`);
     // The arrival cue plays right away at any hour; the 1/10/60-minute
     // reminders and the boot cue respect the waking window.
     await sendReminderCue("mensaje nuevo", { force: true, ignoreWindow: true, sender });

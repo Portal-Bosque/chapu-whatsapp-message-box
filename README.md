@@ -29,6 +29,13 @@ recibe y entrega los audios y usa `wacli` como puente local con WhatsApp.
   no están en la agenda también se aceptan y se anuncian como "desconocido"
   (`data/names/unknown.wav` reemplaza la voz generada).
 - El botón recibir repite el último mensaje escuchado si no hay nuevos.
+- El ESP32 baja a memoria el próximo mensaje apenas llega (o el último
+  escuchado, para repetirlo), así el botón recibir arranca al instante sin
+  esperar la descarga. Apretarlo durante el aviso de voz corta el aviso y pasa
+  directo al mensaje. Notas de más de 60 segundos se bajan al apretar.
+- Cuando llega un mensaje de un contacto de la agenda, ese contacto queda
+  seleccionado para que el botón mandar le responda; al escuchar un mensaje
+  pasa lo mismo con su remitente.
 - Al apretar un botón de agenda, Chapu dice el nombre del contacto. El nombre
   se graba desde el editor de contacto de la web (`data/names/<id>.wav`); si
   no hay grabación, la Mac lo genera con la voz del sistema (`say`). El ESP32
@@ -94,7 +101,11 @@ en el archivo local de secretos del firmware.
 - `GET /api/recordings/:id`: entrega audio con soporte de Range.
 - `GET /api/outbox`: administra la cola destinada al EMEET.
 - `POST /api/device/status`: recibe el heartbeat del ESP32, aplica el botón de
-  agenda presionado y devuelve el estado que deben mostrar las lámparas.
+  agenda presionado y devuelve el estado que deben mostrar las lámparas y el
+  id del próximo mensaje a precargar.
+- `GET /api/outbox/:id`: entrega un audio de la cola sin moverla; lo usa el
+  ESP32 para precargar. `GET /api/outbox/next` responde 204 con `X-Message-ID`
+  cuando el ESP32 ya tiene en memoria el mensaje pendiente (`X-Held-Message`).
 - `GET /api/device/names/:slot`: entrega el nombre hablado de un botón de agenda.
 - `/api/settings/names/:id`: escucha, graba o borra el nombre de un contacto.
 - `POST /api/outbox/release`: libera el próximo mensaje para Chapu, o repite el

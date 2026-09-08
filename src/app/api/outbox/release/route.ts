@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import { appendEvent } from "@/lib/events";
+import { readIncomingMarker, selectSenderRecipient } from "@/lib/incoming";
 import { ensureOutboxDirectories, pendingDirectory, playedDirectory, queuedDirectory } from "@/lib/outbox";
 
 export const runtime = "nodejs";
@@ -16,6 +17,12 @@ async function orderedWaveFiles(directory: string) {
       createdAt: (await fs.stat(path.join(directory, entry.name))).birthtimeMs,
     })));
   return candidates.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+// The note Chapu is about to hear decides who the send button answers.
+async function selectSender(outboxId: string) {
+  const marker = await readIncomingMarker(outboxId);
+  await selectSenderRecipient(marker.senderId, `Escuchando a ${marker.senderLabel ?? "desconocido"}`);
 }
 
 export async function POST(request: Request) {
@@ -50,7 +57,9 @@ export async function POST(request: Request) {
       throw error;
     }
     await appendEvent("device", `${source}: sin mensajes nuevos, repitiendo el último recibido`);
-    return NextResponse.json({ id: last.name.slice(0, -4), status: "pending", replay: true, remaining: 0 });
+    const lastId = last.name.slice(0, -4);
+    await selectSender(lastId);
+    return NextResponse.json({ id: lastId, status: "pending", replay: true, remaining: 0 });
   }
 
   try {
@@ -67,5 +76,6 @@ export async function POST(request: Request) {
 
   const id = next.name.slice(0, -4);
   await appendEvent("device", `${source}: próximo mensaje liberado para Chapu`);
+  await selectSender(id);
   return NextResponse.json({ id, status: "pending", replay: false, remaining: queued.length - 1 });
 }

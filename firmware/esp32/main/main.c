@@ -97,6 +97,22 @@ typedef struct {
 } slot_name_t;
 static slot_name_t s_slot_names[AGENDA_SLOTS];
 
+// The WhatsApp note the listen button would play next (oldest queued, else the
+// last one heard, which the button replays). The web names it in every
+// heartbeat and the ESP32 downloads it into PSRAM ahead of time, so a press
+// only has to ask the web to release it and playback starts at once.
+#define PREFETCH_MAX_BYTES (2 * 1024 * 1024) // ~60 s of PCM16 mono/16 kHz
+typedef struct {
+    char wanted[96];    // id the web reports as next ("" = nothing to play)
+    char loaded[96];    // id currently held, or known to be unavailable
+    uint8_t *wav;       // full WAV file in PSRAM (NULL = not held)
+    const uint8_t *pcm;
+    size_t pcm_size;
+} prefetch_t;
+static prefetch_t s_prefetch;
+static TickType_t s_prefetch_retry_at = 0;
+static TaskHandle_t s_remote_task_handle = NULL; // woken early by the listen button
+
 // Boot greeting, spoken once per boot when Chapu can send and receive.
 static volatile bool s_whatsapp_ready = false;
 static volatile bool s_name_playing = false; // a spoken name / greeting / chime is on the speaker
@@ -225,6 +241,7 @@ static uac_host_device_handle_t s_mic_dev_handle = NULL;
 // playback resources
 static TaskHandle_t s_play_task_handle = NULL;
 static uint8_t *s_remote_wav_buf = NULL;
+static size_t s_remote_wav_size = 0;
 static char s_remote_message_id[96] = {0};
 static volatile bool s_remote_playing = false;
 static volatile bool s_remote_is_notification = false; // short "new message" voice cue
@@ -267,6 +284,8 @@ static void recording_playback_done_cb(void);
 static void remote_playback_done_cb(void);
 static bool ensure_mic_record_buffer(void);
 static esp_err_t start_pcm_playback(player_config_t *config);
+static void drop_prefetch(void);
+static bool play_prefetched_message(const char *id);
 
 static void panel_gpio_init(void)
 {
@@ -323,16 +342,25 @@ static void handle_send_button(void)
 
 static void handle_listen_button(void)
 {
-    if (s_remote_playing || s_play_task_handle != NULL) {
+    if (s_remote_playing && s_remote_is_notification) {
+        // Pressing during the "new message" cue means "just play it".
+        ESP_LOGI(TAG, "Listen button: cutting the voice cue short");
+    } else if (s_remote_playing || s_play_task_handle != NULL) {
         ESP_LOGW(TAG, "Listen button ignored: audio playback is active");
+        return;
     } else if (s_emeet_cycle_active) {
         ESP_LOGW(TAG, "Listen button ignored: a recording is in progress");
+        return;
     } else if (!s_wifi_ready) {
         ESP_LOGW(TAG, "Listen button ignored: Wi-Fi is not ready");
+        return;
     } else {
         // With nothing queued the web replays the last received note.
         ESP_LOGI(TAG, "Listen button: asking the web for the next message (%d queued)", s_queued_messages);
-        s_listen_requested = true;
+    }
+    s_listen_requested = true;
+    if (s_remote_task_handle != NULL) {
+        xTaskNotifyGive(s_remote_task_handle); // skip the poll interval
     }
 }
 
@@ -923,6 +951,10 @@ static esp_err_t fetch_and_play_remote_message(void)
     if (client == NULL) {
         return ESP_FAIL;
     }
+    if (s_prefetch.wav != NULL) {
+        // The web answers 204 with X-Message-ID when the pending note is this one.
+        esp_http_client_set_header(client, "X-Held-Message", s_prefetch.loaded);
+    }
 
     esp_err_t result = esp_http_client_open(client, 0);
     int64_t content_length = -1;
@@ -934,6 +966,9 @@ static esp_err_t fetch_and_play_remote_message(void)
     if (result != ESP_OK || status == 204) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
+        if (result == ESP_OK && context.message_id[0] != '\0' && play_prefetched_message(context.message_id)) {
+            return ESP_OK;
+        }
         return status == 204 ? ESP_ERR_NOT_FOUND : result;
     }
     if (status != 200 || content_length < (int64_t)sizeof(wav_header_t) ||
@@ -952,6 +987,10 @@ static esp_err_t fetch_and_play_remote_message(void)
         s_mic_record_buf = NULL;
     }
     uint8_t *buffer = malloc((size_t)content_length);
+    if (buffer == NULL && s_prefetch.wav != NULL) {
+        drop_prefetch();
+        buffer = malloc((size_t)content_length);
+    }
     if (buffer == NULL) {
         ESP_LOGE(TAG, "Not enough memory for %lld-byte message", content_length);
         esp_http_client_close(client);
@@ -987,6 +1026,7 @@ static esp_err_t fetch_and_play_remote_message(void)
     }
 
     s_remote_wav_buf = buffer;
+    s_remote_wav_size = total;
     strlcpy(s_remote_message_id, context.message_id, sizeof(s_remote_message_id));
     s_remote_is_notification = strncmp(s_remote_message_id, "notify_", 7) == 0;
     s_remote_playing = true;
@@ -1000,6 +1040,7 @@ static esp_err_t fetch_and_play_remote_message(void)
     if (result != ESP_OK) {
         free(s_remote_wav_buf);
         s_remote_wav_buf = NULL;
+        s_remote_wav_size = 0;
         s_remote_message_id[0] = '\0';
         s_remote_playing = false;
         ensure_mic_record_buffer();
@@ -1047,6 +1088,8 @@ static void apply_panel_state(const char *json, size_t json_size)
             strlcpy(s_slot_names[i].version, version, sizeof(s_slot_names[i].version));
         }
     }
+    const cJSON *next = cJSON_GetObjectItemCaseSensitive(root, "next");
+    strlcpy(s_prefetch.wanted, cJSON_IsString(next) ? next->valuestring : "", sizeof(s_prefetch.wanted));
     // Only adopt the web's selection when no newer physical press is waiting;
     // otherwise the lamp would flicker back until the next heartbeat.
     if (s_pending_slot_press < 0) {
@@ -1135,15 +1178,12 @@ static void drop_slot_name(int slot)
     name->loaded[0] = '\0';
 }
 
-// Downloads a PCM16 mono/16 kHz WAV clip into PSRAM. Returns ESP_ERR_NOT_FOUND
-// when the web has nothing for it (HTTP 404/204).
-static esp_err_t download_name_clip(const char *path, uint8_t **wav_out, const uint8_t **pcm_out, size_t *pcm_size_out)
+// Downloads a PCM16 mono/16 kHz WAV file into PSRAM. Returns ESP_ERR_NOT_FOUND
+// when the web has nothing for it (HTTP 404/204) and ESP_ERR_INVALID_SIZE when
+// the file is bigger than `max_bytes`.
+static esp_err_t download_wav_clip(const char *url, size_t max_bytes, const char *label,
+                                   uint8_t **wav_out, const uint8_t **pcm_out, size_t *pcm_size_out)
 {
-    char url[256];
-    int written = snprintf(url, sizeof(url), "%s/%s", MESSAGE_BOX_DEVICE_NAMES_URL, path);
-    if (written <= 0 || written >= (int)sizeof(url)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_GET,
@@ -1166,9 +1206,14 @@ static esp_err_t download_name_clip(const char *path, uint8_t **wav_out, const u
         esp_http_client_cleanup(client);
         return ESP_ERR_NOT_FOUND;
     }
-    if (result != ESP_OK || status != 200 || content_length < (int64_t)sizeof(wav_header_t) ||
-            content_length > NAME_CLIP_MAX_BYTES) {
-        ESP_LOGW(TAG, "Invalid clip response for %s: HTTP %d, length %lld", path, status, content_length);
+    if (result == ESP_OK && status == 200 && content_length > (int64_t)max_bytes) {
+        ESP_LOGW(TAG, "Clip %s is too big to keep in memory (%lld bytes)", label, content_length);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (result != ESP_OK || status != 200 || content_length < (int64_t)sizeof(wav_header_t)) {
+        ESP_LOGW(TAG, "Invalid clip response for %s: HTTP %d, length %lld", label, status, content_length);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result;
@@ -1195,7 +1240,7 @@ static esp_err_t download_name_clip(const char *path, uint8_t **wav_out, const u
     const uint8_t *pcm = NULL;
     size_t pcm_size = 0;
     if (result != ESP_OK || total != (size_t)content_length || !parse_remote_wave(buffer, total, &pcm, &pcm_size)) {
-        ESP_LOGW(TAG, "Clip %s is not PCM16 mono/16 kHz WAV", path);
+        ESP_LOGW(TAG, "Clip %s is not PCM16 mono/16 kHz WAV", label);
         free(buffer);
         return result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result;
     }
@@ -1203,6 +1248,147 @@ static esp_err_t download_name_clip(const char *path, uint8_t **wav_out, const u
     *pcm_out = pcm;
     *pcm_size_out = pcm_size;
     return ESP_OK;
+}
+
+static esp_err_t download_name_clip(const char *path, uint8_t **wav_out, const uint8_t **pcm_out, size_t *pcm_size_out)
+{
+    char url[256];
+    int written = snprintf(url, sizeof(url), "%s/%s", MESSAGE_BOX_DEVICE_NAMES_URL, path);
+    if (written <= 0 || written >= (int)sizeof(url)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    esp_err_t result = download_wav_clip(url, NAME_CLIP_MAX_BYTES, path, wav_out, pcm_out, pcm_size_out);
+    return result == ESP_ERR_INVALID_SIZE ? ESP_ERR_INVALID_RESPONSE : result;
+}
+
+static void drop_prefetch(void)
+{
+    free(s_prefetch.wav);
+    s_prefetch.wav = NULL;
+    s_prefetch.pcm = NULL;
+    s_prefetch.pcm_size = 0;
+    s_prefetch.loaded[0] = '\0';
+}
+
+// Brings the held note in line with the one the web reports as next.
+static esp_err_t sync_prefetch(void)
+{
+    if (strcmp(s_prefetch.wanted, s_prefetch.loaded) == 0) {
+        return ESP_OK;
+    }
+    if (s_prefetch.wanted[0] == '\0') {
+        drop_prefetch();
+        return ESP_OK;
+    }
+    if ((int32_t)(xTaskGetTickCount() - s_prefetch_retry_at) < 0) {
+        return ESP_OK; // backing off after a failed download
+    }
+
+    char wanted[sizeof(s_prefetch.wanted)];
+    strlcpy(wanted, s_prefetch.wanted, sizeof(wanted));
+    char url[256];
+    int written = snprintf(url, sizeof(url), "%s/%s", MESSAGE_BOX_OUTBOX_URL, wanted);
+    if (written <= 0 || written >= (int)sizeof(url)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    uint8_t *wav = NULL;
+    const uint8_t *pcm = NULL;
+    size_t pcm_size = 0;
+    esp_err_t result = download_wav_clip(url, PREFETCH_MAX_BYTES, wanted, &wav, &pcm, &pcm_size);
+    if (result == ESP_ERR_NOT_FOUND || result == ESP_ERR_INVALID_SIZE) {
+        // Gone, or too long to hold: the listen button downloads it on demand.
+        drop_prefetch();
+        strlcpy(s_prefetch.loaded, wanted, sizeof(s_prefetch.loaded));
+        return ESP_OK;
+    }
+    if (result != ESP_OK) {
+        s_prefetch_retry_at = xTaskGetTickCount() + pdMS_TO_TICKS(3000);
+        return result;
+    }
+    drop_prefetch();
+    s_prefetch.wav = wav;
+    s_prefetch.pcm = pcm;
+    s_prefetch.pcm_size = pcm_size;
+    strlcpy(s_prefetch.loaded, wanted, sizeof(s_prefetch.loaded));
+    ESP_LOGI(TAG, "Next message %s prefetched (%u PCM bytes)", wanted, (unsigned)pcm_size);
+    return ESP_OK;
+}
+
+// Starts the held note when it is the one the web just released.
+static bool play_prefetched_message(const char *id)
+{
+    if (s_prefetch.wav == NULL || strcmp(s_prefetch.loaded, id) != 0) {
+        return false;
+    }
+    // Ownership moves to the playback path, which frees or keeps it after the ack.
+    s_remote_wav_buf = s_prefetch.wav;
+    s_remote_wav_size = (size_t)(s_prefetch.pcm - s_prefetch.wav) + s_prefetch.pcm_size;
+    strlcpy(s_remote_message_id, id, sizeof(s_remote_message_id));
+    player_config_t playback = {
+        .pcm_ptr = s_prefetch.pcm,
+        .pcm_size = s_prefetch.pcm_size,
+        .convert_mono_16k_to_stereo_48k = true,
+        .complete_cb = remote_playback_done_cb,
+    };
+    s_prefetch.wav = NULL;
+    s_prefetch.pcm = NULL;
+    s_prefetch.pcm_size = 0;
+    s_prefetch.loaded[0] = '\0';
+
+    s_remote_is_notification = false;
+    s_remote_playing = true;
+    if (start_pcm_playback(&playback) != ESP_OK) {
+        free(s_remote_wav_buf);
+        s_remote_wav_buf = NULL;
+        s_remote_wav_size = 0;
+        s_remote_message_id[0] = '\0';
+        s_remote_playing = false;
+        return false;
+    }
+    ESP_LOGI(TAG, "Playing web message %s from memory (%u PCM bytes)", id, (unsigned)playback.pcm_size);
+    return true;
+}
+
+// Acknowledges the note that just finished. A WhatsApp note stays in memory
+// because the web will name it as next (the button replays it) until a new one
+// arrives; cues are disposable.
+static void finish_remote_playback(void)
+{
+    if (acknowledge_remote_message() != ESP_OK) {
+        return; // retried on the next pass
+    }
+    const uint8_t *pcm = NULL;
+    size_t pcm_size = 0;
+    if (!s_remote_is_notification && s_remote_wav_size <= PREFETCH_MAX_BYTES &&
+            parse_remote_wave(s_remote_wav_buf, s_remote_wav_size, &pcm, &pcm_size)) {
+        drop_prefetch();
+        s_prefetch.wav = s_remote_wav_buf;
+        s_prefetch.pcm = pcm;
+        s_prefetch.pcm_size = pcm_size;
+        strlcpy(s_prefetch.loaded, s_remote_message_id, sizeof(s_prefetch.loaded));
+        ESP_LOGI(TAG, "Keeping %s in memory for an instant replay", s_remote_message_id);
+    } else {
+        free(s_remote_wav_buf);
+    }
+    s_remote_wav_buf = NULL;
+    s_remote_wav_size = 0;
+    s_remote_message_id[0] = '\0';
+    s_remote_playback_finished = false;
+    s_remote_playing = false;
+    ensure_mic_record_buffer();
+}
+
+// Stops the voice cue on the speaker so the requested note can start.
+static void stop_remote_cue(void)
+{
+    if (!s_remote_playing || !s_remote_is_notification || s_play_task_handle == NULL) {
+        return;
+    }
+    s_stop_play_request = true;
+    for (int i = 0; i < 100 && !s_remote_playback_finished; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    s_stop_play_request = false;
 }
 
 static esp_err_t fetch_slot_name(int slot)
@@ -1279,8 +1465,10 @@ static int slot_name_needing_sync(void)
     return -1;
 }
 
-static esp_err_t release_next_message(void)
+// Asks the web to release the next note; `released_id` receives its id.
+static esp_err_t release_next_message(char *released_id, size_t released_id_size)
 {
+    released_id[0] = '\0';
     char url[256];
     int written = snprintf(url, sizeof(url), "%s/release", MESSAGE_BOX_OUTBOX_URL);
     if (written <= 0 || written >= (int)sizeof(url)) {
@@ -1297,9 +1485,19 @@ static esp_err_t release_next_message(void)
         return ESP_FAIL;
     }
     esp_http_client_set_header(client, "X-Device-ID", "message-box-esp32");
-    esp_http_client_set_post_field(client, "", 0);
-    esp_err_t result = esp_http_client_perform(client);
-    int status = esp_http_client_get_status_code(client);
+    esp_err_t result = esp_http_client_open(client, 0);
+    int status = 0;
+    char response[256];
+    int response_size = 0;
+    if (result == ESP_OK) {
+        if (esp_http_client_fetch_headers(client) < 0) {
+            result = ESP_FAIL;
+        } else {
+            status = esp_http_client_get_status_code(client);
+            response_size = esp_http_client_read_response(client, response, sizeof(response) - 1);
+        }
+    }
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
     if (result != ESP_OK) {
         return result;
@@ -1316,7 +1514,15 @@ static esp_err_t release_next_message(void)
     if (status < 200 || status >= 300) {
         return ESP_ERR_INVALID_RESPONSE;
     }
-    ESP_LOGI(TAG, "Next message released; it will be downloaded on the next poll");
+    if (response_size > 0) {
+        cJSON *root = cJSON_ParseWithLength(response, (size_t)response_size);
+        const cJSON *id = root != NULL ? cJSON_GetObjectItemCaseSensitive(root, "id") : NULL;
+        if (cJSON_IsString(id)) {
+            strlcpy(released_id, id->valuestring, released_id_size);
+        }
+        cJSON_Delete(root);
+    }
+    ESP_LOGI(TAG, "Next message released: %s", released_id[0] != '\0' ? released_id : "(unknown id)");
     return ESP_OK;
 }
 
@@ -1335,20 +1541,23 @@ static void remote_messages_task(void *arg)
         }
         if (s_wifi_ready && s_listen_requested) {
             s_listen_requested = false;
-            esp_err_t release_result = release_next_message();
-            if (release_result == ESP_OK) {
-                s_status_dirty = true;
+            stop_remote_cue();
+            if (s_remote_playback_finished) {
+                finish_remote_playback(); // the cue must be acknowledged before the note plays
+            }
+            if (!s_remote_playing && s_play_task_handle == NULL) {
+                char released_id[sizeof(s_remote_message_id)];
+                esp_err_t release_result = release_next_message(released_id, sizeof(released_id));
+                if (release_result == ESP_OK) {
+                    s_status_dirty = true;
+                    if (released_id[0] != '\0' && !play_prefetched_message(released_id)) {
+                        ESP_LOGI(TAG, "Message %s is not in memory; downloading it now", released_id);
+                    }
+                }
             }
         }
         if (s_remote_playback_finished) {
-            if (acknowledge_remote_message() == ESP_OK) {
-                free(s_remote_wav_buf);
-                s_remote_wav_buf = NULL;
-                s_remote_message_id[0] = '\0';
-                s_remote_playback_finished = false;
-                s_remote_playing = false;
-                ensure_mic_record_buffer();
-            }
+            finish_remote_playback();
         } else if (s_wifi_ready && s_spk_dev_handle != NULL && !s_remote_playing &&
                    s_play_task_handle == NULL) {
             if (!s_greeting_played && s_whatsapp_ready && s_mic_dev_handle != NULL && !s_emeet_cycle_active) {
@@ -1378,7 +1587,17 @@ static void remote_messages_task(void *arg)
                 ESP_LOGW(TAG, "Could not fetch the record command: %s", esp_err_to_name(command_result));
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
+        // Download the next note while idle, or while a cue is on the speaker so
+        // a press during the cue also plays from memory.
+        if (s_wifi_ready && !s_emeet_cycle_active && !s_remote_playback_finished &&
+                (s_remote_playing ? s_remote_is_notification : s_play_task_handle == NULL)) {
+            esp_err_t prefetch_result = sync_prefetch();
+            if (prefetch_result != ESP_OK) {
+                ESP_LOGW(TAG, "Could not prefetch the next message: %s", esp_err_to_name(prefetch_result));
+            }
+        }
+        // The listen button wakes this task instead of waiting out the interval.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
     }
 }
 
@@ -1794,7 +2013,7 @@ void app_main(void)
                                   USB_HOST_TASK_PRIORITY, NULL, 0);
     assert(ret == pdTRUE);
     ret = xTaskCreatePinnedToCore(remote_messages_task, "remote_messages", 8192, NULL,
-                                  USER_TASK_PRIORITY, NULL, 1);
+                                  USER_TASK_PRIORITY, &s_remote_task_handle, 1);
     assert(ret == pdTRUE);
     ret = xTaskCreatePinnedToCore(panel_task, "panel", 4096, NULL,
                                   USER_TASK_PRIORITY, NULL, 1);

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { DEVICE_ONLINE_WINDOW_MS, heartbeatAgeMs, readDeviceHeartbeat, writeDeviceHeartbeat, type DeviceHeartbeat } from "@/lib/device";
 import { appendEvent } from "@/lib/events";
 import { slotNameVersions } from "@/lib/names";
-import { listOutboxMessages } from "@/lib/outbox";
+import { listOutboxMessages, nextMessageForDevice } from "@/lib/outbox";
 import { sendReminderCue } from "@/lib/reminders";
 import { AGENDA_SLOTS, readSettings, selectRecipient } from "@/lib/settings";
 import { isWhatsappReady } from "@/lib/wacli";
@@ -24,6 +24,8 @@ async function panelState() {
     names: await slotNameVersions(settings),
     queued: incoming.filter((message) => message.status === "queued").length,
     playing: incoming.some((message) => message.status === "pending"),
+    // Note the ESP32 should hold in memory so the listen button plays instantly.
+    next: await nextMessageForDevice(),
     // Lets the ESP32 announce itself only once it can really send and receive.
     whatsappReady: await isWhatsappReady(),
   };
