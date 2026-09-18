@@ -38,6 +38,7 @@ yarn-error.log*
 !/data/recordings/.gitkeep
 /data/outbox/**/*.wav
 !/data/outbox/**/.gitkeep
+/data/outbox/replay.json*
 /data/device/*.json
 !/data/device/.gitkeep
 /data/settings.json

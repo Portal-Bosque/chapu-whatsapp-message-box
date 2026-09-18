@@ -51,10 +51,54 @@ export async function listOutboxMessages() {
   return [...queued, ...pending, ...played].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+// With nothing new waiting, the listen button replays one of the last few
+// notes heard, picked at random. The pick is made ahead of the press and kept
+// on disk so the ESP32 prefetches the same note the release then hands out.
+const REPLAY_POOL_SIZE = 5;
+const replayStatePath = path.join(outboxDirectory, "replay.json");
+
+type ReplayState = { pick?: string; lastReleased?: string };
+
+async function readReplayState(): Promise<ReplayState> {
+  return fs.readFile(replayStatePath, "utf8")
+    .then((value) => JSON.parse(value) as ReplayState)
+    .catch(() => ({}));
+}
+
+async function writeReplayState(state: ReplayState) {
+  const temporaryPath = `${replayStatePath}.${process.pid}.tmp`;
+  await fs.writeFile(temporaryPath, JSON.stringify(state));
+  await fs.rename(temporaryPath, replayStatePath);
+}
+
+/**
+ * The note a press replays when the queue is empty: a random one of the last
+ * five heard, never the one that just played unless it is the only one.
+ */
+export async function replayPick() {
+  const pool = (await listOutboxMessages())
+    .filter((message) => message.status === "played" && message.id.startsWith("wa_"))
+    .slice(0, REPLAY_POOL_SIZE) // newest first
+    .map((message) => message.id);
+  if (pool.length === 0) return null;
+  const state = await readReplayState();
+  if (state.pick && pool.includes(state.pick)) return state.pick;
+  const fresh = pool.filter((id) => id !== state.lastReleased);
+  const candidates = fresh.length > 0 ? fresh : pool;
+  const pick = candidates[Math.floor(Math.random() * candidates.length)];
+  await writeReplayState({ ...state, pick });
+  return pick;
+}
+
+/** Records the note handed to Chapu so the next random pick is a different one. */
+export async function noteReleased(id: string) {
+  await writeReplayState({ lastReleased: id });
+}
+
 /**
  * The WhatsApp note the listen button would play next: the oldest queued one,
- * or the last one heard when nothing new is waiting (the button replays it).
- * The ESP32 downloads it ahead of time so a press starts playing at once.
+ * or the random replay pick when nothing new is waiting. The ESP32 downloads
+ * it ahead of time so a press starts playing at once.
  */
 export async function nextMessageForDevice() {
   const notes = (await listOutboxMessages())
@@ -62,12 +106,11 @@ export async function nextMessageForDevice() {
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const queued = notes.find((message) => message.status === "queued");
   if (queued) return queued.id;
-  // The note on the speaker becomes the replay target the moment it ends, so
-  // naming it now lets the ESP32 keep it instead of re-downloading it.
+  // While a note is on the speaker keep naming it, so the ESP32 does not start
+  // another download mid-playback; the next pick is named once it ends.
   const pending = notes.find((message) => message.status === "pending");
   if (pending) return pending.id;
-  const played = notes.filter((message) => message.status === "played");
-  return played.length > 0 ? played[played.length - 1].id : null;
+  return replayPick();
 }
 
 export async function findOutboxWave(id: string) {

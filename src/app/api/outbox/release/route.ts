@@ -3,7 +3,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { appendEvent } from "@/lib/events";
 import { readIncomingMarker, selectSenderRecipient } from "@/lib/incoming";
-import { ensureOutboxDirectories, pendingDirectory, playedDirectory, queuedDirectory } from "@/lib/outbox";
+import { ensureOutboxDirectories, noteReleased, pendingDirectory, playedDirectory, queuedDirectory, replayPick } from "@/lib/outbox";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,16 +39,15 @@ export async function POST(request: Request) {
   const next = queued[0];
 
   if (!next) {
-    // Nothing new: replay the most recent WhatsApp note Chapu already played.
-    const played = (await orderedWaveFiles(playedDirectory)).filter((message) => message.name.startsWith("wa_"));
-    const last = played[played.length - 1];
-    if (!last) {
+    // Nothing new: replay a random one of the last notes Chapu already played.
+    const lastId = await replayPick();
+    if (!lastId) {
       return NextResponse.json({ error: "No hay mensajes por escuchar" }, { status: 404 });
     }
     try {
       await fs.rename(
-        path.join(playedDirectory, last.name),
-        path.join(pendingDirectory, last.name),
+        path.join(playedDirectory, `${lastId}.wav`),
+        path.join(pendingDirectory, `${lastId}.wav`),
       );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -56,8 +55,8 @@ export async function POST(request: Request) {
       }
       throw error;
     }
-    await appendEvent("device", `${source}: sin mensajes nuevos, repitiendo el último recibido`);
-    const lastId = last.name.slice(0, -4);
+    await noteReleased(lastId);
+    await appendEvent("device", `${source}: sin mensajes nuevos, repitiendo uno al azar de los últimos 5`);
     await selectSender(lastId);
     return NextResponse.json({ id: lastId, status: "pending", replay: true, remaining: 0 });
   }
@@ -75,6 +74,7 @@ export async function POST(request: Request) {
   }
 
   const id = next.name.slice(0, -4);
+  await noteReleased(id);
   await appendEvent("device", `${source}: próximo mensaje liberado para Chapu`);
   await selectSender(id);
   return NextResponse.json({ id, status: "pending", replay: false, remaining: queued.length - 1 });

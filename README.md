@@ -28,7 +28,7 @@ recibe y entrega los audios y usa `wacli` como puente local con WhatsApp.
   fuera de Git) y a continuación dice el nombre del remitente. Los números que
   no están en la agenda también se aceptan y se anuncian como "desconocido"
   (`data/names/unknown.wav` reemplaza la voz generada).
-- El botón recibir repite el último mensaje escuchado si no hay nuevos.
+- El botón recibir, si no hay mensajes nuevos, repite uno al azar de los últimos 5 escuchados.
 - El ESP32 baja a memoria el próximo mensaje apenas llega (o el último
   escuchado, para repetirlo), así el botón recibir arranca al instante sin
   esperar la descarga. Apretarlo durante el aviso de voz corta el aviso y pasa
@@ -108,8 +108,8 @@ en el archivo local de secretos del firmware.
   cuando el ESP32 ya tiene en memoria el mensaje pendiente (`X-Held-Message`).
 - `GET /api/device/names/:slot`: entrega el nombre hablado de un botón de agenda.
 - `/api/settings/names/:id`: escucha, graba o borra el nombre de un contacto.
-- `POST /api/outbox/release`: libera el próximo mensaje para Chapu, o repite el
-  último escuchado si no hay nuevos; lo usan el botón recibir de la caja y el de
+- `POST /api/outbox/release`: libera el próximo mensaje para Chapu, o repite uno
+  al azar de los últimos 5 escuchados si no hay nuevos; lo usan el botón recibir de la caja y el de
   la web.
 - `/api/whatsapp/*`: autenticación, estado, lista de grupos y recepción
   mediante `wacli`.

@@ -97,8 +97,8 @@ typedef struct {
 } slot_name_t;
 static slot_name_t s_slot_names[AGENDA_SLOTS];
 
-// The WhatsApp note the listen button would play next (oldest queued, else the
-// last one heard, which the button replays). The web names it in every
+// The WhatsApp note the listen button would play next (oldest queued, else a
+// random one of the last few heard, which the button replays). The web names it in every
 // heartbeat and the ESP32 downloads it into PSRAM ahead of time, so a press
 // only has to ask the web to release it and playback starts at once.
 #define PREFETCH_MAX_BYTES (2 * 1024 * 1024) // ~60 s of PCM16 mono/16 kHz
@@ -355,7 +355,7 @@ static void handle_listen_button(void)
         ESP_LOGW(TAG, "Listen button ignored: Wi-Fi is not ready");
         return;
     } else {
-        // With nothing queued the web replays the last received note.
+        // With nothing queued the web replays a random recent note.
         ESP_LOGI(TAG, "Listen button: asking the web for the next message (%d queued)", s_queued_messages);
     }
     s_listen_requested = true;
@@ -1350,8 +1350,9 @@ static bool play_prefetched_message(const char *id)
 }
 
 // Acknowledges the note that just finished. A WhatsApp note stays in memory
-// because the web will name it as next (the button replays it) until a new one
-// arrives; cues are disposable.
+// in case the web names it as next again (the button replays recent notes);
+// otherwise the prefetch swaps it for the note the web does name. Cues are
+// disposable.
 static void finish_remote_playback(void)
 {
     if (acknowledge_remote_message() != ESP_OK) {
