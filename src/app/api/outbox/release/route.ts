@@ -3,7 +3,8 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { appendEvent } from "@/lib/events";
 import { readIncomingMarker, selectSenderRecipient } from "@/lib/incoming";
-import { ensureOutboxDirectories, noteReleased, pendingDirectory, playedDirectory, queuedDirectory, replayPick } from "@/lib/outbox";
+import { isJokeId, jokePath } from "@/lib/jokes";
+import { ensureOutboxDirectories, isListenable, noteReleased, pendingDirectory, playedDirectory, queuedDirectory, replayPick } from "@/lib/outbox";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -30,7 +31,7 @@ export async function POST(request: Request) {
   const fromDevice = request.headers.get("x-device-id") !== null;
 
   const pending = await orderedWaveFiles(pendingDirectory);
-  if (pending.some((message) => message.name.startsWith("wa_"))) {
+  if (pending.some((message) => isListenable(message.name))) {
     return NextResponse.json({ error: "Chapu ya está reproduciendo otro mensaje" }, { status: 409 });
   }
 
@@ -39,16 +40,20 @@ export async function POST(request: Request) {
   const next = queued[0];
 
   if (!next) {
-    // Nothing new: replay a random one of the last notes Chapu already played.
+    // Nothing new: replay a random note from yesterday or today, or one of
+    // Chapu's invented messages when those days were quiet.
     const lastId = await replayPick();
     if (!lastId) {
       return NextResponse.json({ error: "No hay mensajes por escuchar" }, { status: 404 });
     }
+    const pendingPath = path.join(pendingDirectory, `${lastId}.wav`);
     try {
-      await fs.rename(
-        path.join(playedDirectory, `${lastId}.wav`),
-        path.join(pendingDirectory, `${lastId}.wav`),
-      );
+      if (isJokeId(lastId)) {
+        // Invented messages stay in their folder; Chapu plays a disposable copy.
+        await fs.copyFile(jokePath(lastId), pendingPath);
+      } else {
+        await fs.rename(path.join(playedDirectory, `${lastId}.wav`), pendingPath);
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return NextResponse.json({ error: "La cola cambió; probá nuevamente" }, { status: 409 });
@@ -56,8 +61,12 @@ export async function POST(request: Request) {
       throw error;
     }
     await noteReleased(lastId);
-    await appendEvent("device", `${source}: sin mensajes nuevos, repitiendo uno al azar de los últimos 5`);
-    await selectSender(lastId);
+    if (isJokeId(lastId)) {
+      await appendEvent("device", `${source}: sin mensajes nuevos, Chapu cuenta uno de sus mensajes inventados`);
+    } else {
+      await appendEvent("device", `${source}: sin mensajes nuevos, repitiendo uno al azar de ayer y hoy`);
+      await selectSender(lastId);
+    }
     return NextResponse.json({ id: lastId, status: "pending", replay: true, remaining: 0 });
   }
 

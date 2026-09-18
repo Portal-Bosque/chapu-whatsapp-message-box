@@ -24,7 +24,7 @@ microswitch y otro para la lámpara.
 | Agenda 1  | GPIO 15          | GPIO 16         | Fija cuando es el destinatario elegido                |
 | Agenda 2  | GPIO 17          | GPIO 18         | Fija cuando es el destinatario elegido                |
 | Agenda 3  | GPIO 10          | GPIO 11         | Fija cuando es el destinatario elegido                |
-| Agenda 4  | GPIO 12          | GPIO 13         | Fija cuando es el destinatario elegido                |
+| Ruleta    | GPIO 12          | GPIO 13         | Gira y elige un contacto al azar; fija si sale el 4.º  |
 
 Microswitch: `COM` a `GND` y `NO` al GPIO del botón. El firmware activa el
 pull-up interno, así que una pulsación se lee en bajo. No hace falta resistencia.

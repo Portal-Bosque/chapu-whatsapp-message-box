@@ -1,5 +1,7 @@
 import { promises as fs } from "node:fs";
+import { readDeviceHeartbeat } from "@/lib/device";
 import { resolveGreeting, resolveName, type ResolvedName } from "@/lib/names";
+import { ROULETTE_NAME_VERSION, ROULETTE_SLOT, rouletteSpinClip } from "@/lib/roulette";
 import { AGENDA_SLOTS, readSettings } from "@/lib/settings";
 
 export const runtime = "nodejs";
@@ -10,6 +12,10 @@ async function resolveSlot(slot: string): Promise<ResolvedName | null> {
   const index = Number(slot);
   if (!Number.isInteger(index) || index < 0 || index >= AGENDA_SLOTS) {
     throw new Error("Invalid slot");
+  }
+  if (index === ROULETTE_SLOT && (await readDeviceHeartbeat())?.localRoulette !== true) {
+    // Firmware without its own roulette plays this "name" when GPIO 12 is pressed.
+    return { source: "generated", version: ROULETTE_NAME_VERSION, filePath: await rouletteSpinClip() };
   }
   const settings = await readSettings();
   const recipient = settings.recipients[index];

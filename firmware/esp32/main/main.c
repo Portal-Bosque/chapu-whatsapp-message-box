@@ -17,6 +17,7 @@
 #include "esp_err.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_heap_caps.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
@@ -47,6 +48,12 @@ static bool s_wifi_ready = false;
 #define BUTTON_SEND 0
 #define BUTTON_LISTEN 1
 #define BUTTON_AGENDA_FIRST 2
+// The fourth agenda button (GPIO 12) is a roulette: it spins through the agenda
+// with a lottery sound and lands on a random contact. Its lamp still shows
+// slot 4 when the roulette (or the web) selects that contact.
+#define BUTTON_ROULETTE (BUTTON_AGENDA_FIRST + 3)
+#define ROULETTE_SPIN_MS 3000
+#define ROULETTE_MAX_TICKS 40
 
 static const gpio_num_t s_button_gpios[BUTTON_COUNT] = {
     GPIO_NUM_4,   // Mandar
@@ -54,7 +61,7 @@ static const gpio_num_t s_button_gpios[BUTTON_COUNT] = {
     GPIO_NUM_15,  // Agenda 1
     GPIO_NUM_17,  // Agenda 2
     GPIO_NUM_10,  // Agenda 3
-    GPIO_NUM_12,  // Agenda 4
+    GPIO_NUM_12,  // Ruleta (lamp and contact of agenda 4)
 };
 
 static const gpio_num_t s_led_gpios[BUTTON_COUNT] = {
@@ -83,6 +90,17 @@ static volatile bool s_slot_configured[AGENDA_SLOTS] = {false};
 static volatile int s_queued_messages = 0;       // WhatsApp notes waiting for the listen button
 static volatile bool s_listen_requested = false;
 static volatile bool s_status_dirty = false;
+
+// Roulette spin: the winner is drawn when the button is pressed and the lamps
+// chase in step with the ticks of the sound so the last tick lands on it.
+static volatile bool s_roulette_spinning = false;
+static volatile bool s_roulette_report = false;  // tell the web the next slot came from the roulette
+static volatile int s_roulette_winner = -1;
+static volatile TickType_t s_roulette_started_at = 0;
+static uint16_t s_roulette_tick_ms[ROULETTE_MAX_TICKS];
+static int s_roulette_tick_count = 0;
+static int16_t *s_roulette_pcm = NULL;
+static size_t s_roulette_pcm_size = 0;
 
 // Spoken contact names, one per agenda slot, downloaded from the web and kept
 // in PSRAM so a press answers immediately. The web reports a version string per
@@ -383,6 +401,7 @@ static bool make_room_for_cue(void)
     if (!s_name_playing) {
         return false;
     }
+    s_roulette_winner = -1; // a spin that gets cut short selects nothing
     s_stop_play_request = true;
     for (int i = 0; i < 50 && s_play_task_handle != NULL; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -450,6 +469,73 @@ static void handle_agenda_button(int slot)
     play_slot_name_or_chime(slot);
 }
 
+// Tick of the spin that is sounding right now, from the time since the press.
+static int roulette_current_tick(void)
+{
+    uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - s_roulette_started_at);
+    int tick = 0;
+    while (tick + 1 < s_roulette_tick_count && s_roulette_tick_ms[tick + 1] <= elapsed_ms) {
+        tick++;
+    }
+    return tick;
+}
+
+// Runs when the lottery sound ends: select the winner and say its name.
+static void roulette_done_cb(void)
+{
+    const int winner = s_roulette_winner;
+    s_roulette_spinning = false;
+    s_name_playing = false;
+    if (winner < 0) {
+        return; // another button cut the spin short; that press decides
+    }
+    ESP_LOGI(TAG, "Roulette landed on agenda slot %d", winner + 1);
+    s_selected_slot = winner;
+    s_pending_slot_press = winner;
+    s_roulette_report = true;
+    s_status_dirty = true;
+    play_slot_name_or_chime(winner);
+}
+
+static void handle_roulette_button(void)
+{
+    if (s_roulette_spinning) {
+        return; // already spinning
+    }
+    int candidates[AGENDA_SLOTS];
+    int candidate_count = 0;
+    for (int i = 0; i < AGENDA_SLOTS; i++) {
+        if (s_slot_configured[i] && i != s_selected_slot) {
+            candidates[candidate_count++] = i;
+        }
+    }
+    if (candidate_count == 0 && s_selected_slot >= 0 && s_slot_configured[s_selected_slot]) {
+        candidates[candidate_count++] = s_selected_slot; // the only contact there is
+    }
+    if (candidate_count == 0) {
+        ESP_LOGW(TAG, "Roulette ignored: no contacts configured in the web");
+        return;
+    }
+    if (s_spk_dev_handle == NULL || s_roulette_pcm == NULL || !make_room_for_cue()) {
+        ESP_LOGI(TAG, "Roulette skipped: audio is busy");
+        return;
+    }
+    s_roulette_winner = candidates[esp_random() % candidate_count];
+    ESP_LOGI(TAG, "Roulette spinning");
+    player_config_t spin = {
+        .pcm_ptr = (const uint8_t *)s_roulette_pcm,
+        .pcm_size = s_roulette_pcm_size,
+        .complete_cb = roulette_done_cb,
+    };
+    s_roulette_started_at = xTaskGetTickCount();
+    s_roulette_spinning = true;
+    s_name_playing = true;
+    if (start_pcm_playback(&spin) != ESP_OK) {
+        s_roulette_spinning = false;
+        s_name_playing = false;
+    }
+}
+
 static led_mode_t desired_led_mode(int button)
 {
     switch (button) {
@@ -462,6 +548,12 @@ static led_mode_t desired_led_mode(int button)
         return s_queued_messages > 0 ? LED_BLINK : LED_OFF;
     default: {
         int slot = button - BUTTON_AGENDA_FIRST;
+        if (s_roulette_spinning) {
+            // One lamp at a time, timed so the last tick lights the winner.
+            int ticks_left = s_roulette_tick_count - 1 - roulette_current_tick();
+            int lit = ((s_roulette_winner - ticks_left) % AGENDA_SLOTS + AGENDA_SLOTS) % AGENDA_SLOTS;
+            return slot == lit ? LED_ON : LED_OFF;
+        }
         return slot == s_selected_slot ? LED_ON : LED_OFF;
     }
     }
@@ -504,6 +596,8 @@ static void panel_task(void *arg)
                 handle_send_button();
             } else if (i == BUTTON_LISTEN) {
                 handle_listen_button();
+            } else if (i == BUTTON_ROULETTE) {
+                handle_roulette_button();
             } else {
                 handle_agenda_button(i - BUTTON_AGENDA_FIRST);
             }
@@ -589,7 +683,7 @@ static void pcm_play_task(void *arg)
         size_t remaining = config->pcm_size - byte_offset;
         size_t bytes_to_write = remaining > chunk_bytes ? chunk_bytes : remaining;
         const uint8_t *buf = config->pcm_ptr + byte_offset;
-        ESP_LOGI(TAG, "Writing %d bytes", bytes_to_write);
+        ESP_LOGD(TAG, "Writing %d bytes", bytes_to_write);
         esp_err_t ret = uac_host_device_write(s_spk_dev_handle, (void *)buf, bytes_to_write, 1000);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "uac_host_device_write failed: %s", esp_err_to_name(ret));
@@ -664,6 +758,46 @@ static void fill_blip(int16_t *pcm, uint32_t sample_rate, float hz, uint32_t dur
     }
 }
 
+// Lottery wheel: bright ticks that start fast and slow down over the spin,
+// cycling through a pentatonic scale, then a two-note "ta-da" on the winner.
+static void prepare_roulette_sound(uint32_t sample_rate)
+{
+    static const float scale_hz[] = {1046.50f, 1174.66f, 1318.51f, 1567.98f, 1760.00f};
+    const uint32_t tada_ms = 95 + 25 + 145;
+    const uint32_t total_ms = ROULETTE_SPIN_MS + tada_ms;
+    const uint32_t frames = sample_rate * total_ms / 1000;
+    s_roulette_pcm_size = (size_t)frames * 2 * sizeof(int16_t);
+    s_roulette_pcm = heap_caps_calloc(1, s_roulette_pcm_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(s_roulette_pcm != NULL);
+
+    // Gaps grow geometrically from 55 ms; the last tick falls where the ta-da starts.
+    float at_ms = 0.0f;
+    float gap_ms = 55.0f;
+    s_roulette_tick_count = 0;
+    while (at_ms < (float)ROULETTE_SPIN_MS - 250.0f && s_roulette_tick_count < ROULETTE_MAX_TICKS - 1) {
+        s_roulette_tick_ms[s_roulette_tick_count++] = (uint16_t)at_ms;
+        at_ms += gap_ms;
+        gap_ms *= 1.09f;
+    }
+    s_roulette_tick_ms[s_roulette_tick_count++] = ROULETTE_SPIN_MS;
+
+    const uint32_t tick_frames = sample_rate * 38 / 1000;
+    for (int tick = 0; tick < s_roulette_tick_count - 1; tick++) {
+        uint32_t start = (uint32_t)s_roulette_tick_ms[tick] * sample_rate / 1000;
+        float hz = scale_hz[tick % 5];
+        for (uint32_t frame = 0; frame < tick_frames && start + frame < frames; frame++) {
+            float progress = (float)frame / (float)tick_frames;
+            float envelope = (1.0f - progress) * (1.0f - progress); // sharp, clicky attack
+            float phase = 2.0f * 3.14159265f * hz * frame / sample_rate;
+            int16_t sample = (int16_t)(7000.0f * envelope * (sinf(phase) + 0.3f * sinf(phase * 3.0f)));
+            s_roulette_pcm[(start + frame) * 2] = sample;
+            s_roulette_pcm[(start + frame) * 2 + 1] = sample;
+        }
+    }
+    fill_playful_chime(s_roulette_pcm + (size_t)(sample_rate * ROULETTE_SPIN_MS / 1000) * 2,
+                       sample_rate, 783.99f, 1567.98f); // G5 -> G6
+}
+
 static void prepare_recording_chimes(void)
 {
     const uint32_t sample_rate = 48000;
@@ -687,6 +821,8 @@ static void prepare_recording_chimes(void)
     s_agenda_chime_pcm = malloc(s_agenda_chime_pcm_size);
     assert(s_agenda_chime_pcm != NULL);
     fill_blip(s_agenda_chime_pcm, sample_rate, 1046.50f, blip_ms);
+
+    prepare_roulette_sound(sample_rate);
 }
 
 static void start_recording_cycle(void)
@@ -1105,16 +1241,19 @@ static void apply_panel_state(const char *json, size_t json_size)
 static esp_err_t publish_device_status(void)
 {
     const int pressed_slot = s_pending_slot_press;
-    char payload[160];
+    const bool from_roulette = s_roulette_report;
+    char payload[192];
     int payload_size = snprintf(payload, sizeof(payload),
-                                "{\"speaker\":%s,\"microphone\":%s,\"recording\":%s,\"playing\":%s",
+                                // localRoulette: this firmware spins GPIO 12 itself, so the web must not.
+                                "{\"localRoulette\":true,\"speaker\":%s,\"microphone\":%s,\"recording\":%s,\"playing\":%s",
                                 s_spk_dev_handle != NULL ? "true" : "false",
                                 s_mic_dev_handle != NULL ? "true" : "false",
                                 s_mic_recording ? "true" : "false",
                                 s_remote_playing ? "true" : "false");
     if (payload_size > 0 && payload_size < (int)sizeof(payload) && pressed_slot >= 0) {
         payload_size += snprintf(payload + payload_size, sizeof(payload) - payload_size,
-                                 ",\"selectedSlot\":%d", pressed_slot);
+                                 ",\"selectedSlot\":%d%s", pressed_slot,
+                                 from_roulette ? ",\"roulette\":true" : "");
     }
     if (payload_size > 0 && payload_size < (int)sizeof(payload)) {
         payload_size += snprintf(payload + payload_size, sizeof(payload) - payload_size, "}");
@@ -1161,6 +1300,9 @@ static esp_err_t publish_device_status(void)
 
     if (pressed_slot >= 0 && s_pending_slot_press == pressed_slot) {
         s_pending_slot_press = -1;
+        if (from_roulette) {
+            s_roulette_report = false;
+        }
     }
     if (response_size > 0) {
         apply_panel_state(response, (size_t)response_size);

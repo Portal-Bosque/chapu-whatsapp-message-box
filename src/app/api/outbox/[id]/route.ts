@@ -3,7 +3,9 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { ensureOutboxDirectories, findOutboxWave, pendingDirectory, playedDirectory, safeOutboxId, servedDirectory } from "@/lib/outbox";
 import { appendEvent } from "@/lib/events";
+import { isJokeId } from "@/lib/jokes";
 import { isNotificationId } from "@/lib/notifications";
+import { ROULETTE_CUE_PREFIX } from "@/lib/roulette";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -43,7 +45,16 @@ export async function DELETE(_request: Request, context: { params: Promise<{ id:
       // Voice cues are disposable copies; nothing to keep for replay.
       await fs.unlink(path.join(pendingDirectory, `${id}.wav`));
       await fs.rm(path.join(servedDirectory, id), { force: true });
-      await appendEvent("device", "Chapu avisó que llegó un mensaje nuevo");
+      await appendEvent("device", id.startsWith(ROULETTE_CUE_PREFIX)
+        ? "Chapu anunció a quién le tocó la ruleta"
+        : "Chapu avisó que llegó un mensaje nuevo");
+      return NextResponse.json({ id, status: "played" });
+    }
+    if (isJokeId(id)) {
+      // The played copy is disposable; the original stays with the other invented messages.
+      await fs.unlink(path.join(pendingDirectory, `${id}.wav`));
+      await fs.rm(path.join(servedDirectory, id), { force: true });
+      await appendEvent("device", "Chapu terminó de contar su mensaje inventado");
       return NextResponse.json({ id, status: "played" });
     }
     await fs.rename(

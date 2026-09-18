@@ -4,24 +4,29 @@ import { appendEvent } from "@/lib/events";
 import { slotNameVersions } from "@/lib/names";
 import { listOutboxMessages, nextMessageForDevice } from "@/lib/outbox";
 import { sendReminderCue } from "@/lib/reminders";
+import { ROULETTE_NAME_VERSION, ROULETTE_SLOT, spinningLampSlot, startRouletteSpin } from "@/lib/roulette";
 import { AGENDA_SLOTS, readSettings, selectRecipient } from "@/lib/settings";
 import { isWhatsappReady } from "@/lib/wacli";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type HeartbeatBody = Partial<DeviceHeartbeat> & { selectedSlot?: unknown };
+type HeartbeatBody = Partial<DeviceHeartbeat> & { selectedSlot?: unknown; roulette?: unknown };
 
 // The ESP32 posts its inputs and receives the state its lamps must show.
-async function panelState() {
+async function panelState(webRoulette: boolean) {
   const [settings, messages] = await Promise.all([readSettings(), listOutboxMessages()]);
   const incoming = messages.filter((message) => message.id.startsWith("wa_"));
   const selectedSlot = settings.recipients.findIndex((recipient) => recipient.id === settings.selectedRecipientId);
+  const names = await slotNameVersions(settings);
+  // For firmware without its own roulette the button's "name" is the lottery sound.
+  if (webRoulette) names[ROULETTE_SLOT] = ROULETTE_NAME_VERSION;
   return {
-    selectedSlot: selectedSlot >= 0 && selectedSlot < AGENDA_SLOTS ? selectedSlot : null,
+    // While the roulette turns the lamps hop around instead of showing the selection.
+    selectedSlot: spinningLampSlot() ?? (selectedSlot >= 0 && selectedSlot < AGENDA_SLOTS ? selectedSlot : null),
     slots: Array.from({ length: AGENDA_SLOTS }, (_, index) => Boolean(settings.recipients[index])),
     // Spoken-name versions; the ESP32 re-downloads a slot when its version changes.
-    names: await slotNameVersions(settings),
+    names,
     queued: incoming.filter((message) => message.status === "queued").length,
     playing: incoming.some((message) => message.status === "pending"),
     // Note the ESP32 should hold in memory so the listen button plays instantly.
@@ -44,6 +49,7 @@ export async function POST(request: Request) {
     microphone: body.microphone,
     recording: body.recording === true,
     playing: body.playing === true,
+    ...(body.localRoulette === true ? { localRoulette: true } : {}),
     lastSeenAt: new Date().toISOString(),
   };
   await writeDeviceHeartbeat(heartbeat);
@@ -57,7 +63,13 @@ export async function POST(request: Request) {
     const slot = body.selectedSlot as number;
     const settings = await readSettings();
     const recipient = settings.recipients[slot];
-    if (slot < 0 || slot >= AGENDA_SLOTS || !recipient) {
+    if (slot === ROULETTE_SLOT && body.localRoulette !== true) {
+      // Firmware that treats GPIO 12 as a plain agenda button: the web spins.
+      await startRouletteSpin();
+    } else if (body.roulette === true && recipient) {
+      if (recipient.id !== settings.selectedRecipientId) await selectRecipient(recipient.id);
+      await appendEvent("device", `Ruleta: le tocó a ${recipient.label}, ahora se habla con ${recipient.label}`);
+    } else if (slot < 0 || slot >= AGENDA_SLOTS || !recipient) {
       await appendEvent("device", `Botón de agenda ${slot + 1} presionado, pero no tiene contacto asignado`);
     } else if (recipient.id !== settings.selectedRecipientId) {
       await selectRecipient(recipient.id);
@@ -65,7 +77,7 @@ export async function POST(request: Request) {
     }
   }
 
-  return NextResponse.json({ received: true, ...(await panelState()) }, { headers: { "Cache-Control": "no-store" } });
+  return NextResponse.json({ received: true, ...(await panelState(body.localRoulette !== true)) }, { headers: { "Cache-Control": "no-store" } });
 }
 
 export async function GET() {

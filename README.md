@@ -28,7 +28,11 @@ recibe y entrega los audios y usa `wacli` como puente local con WhatsApp.
   fuera de Git) y a continuación dice el nombre del remitente. Los números que
   no están en la agenda también se aceptan y se anuncian como "desconocido"
   (`data/names/unknown.wav` reemplaza la voz generada).
-- El botón recibir, si no hay mensajes nuevos, repite uno al azar de los últimos 5 escuchados.
+- El botón recibir, si no hay mensajes nuevos, repite uno al azar de los recibidos ayer y hoy. Si hay menos
+  de 5, Chapu completa con mensajes graciosos inventados (`src/lib/jokes.ts`, voces de la Mac).
+- El cuarto botón de agenda (GPIO 12) es una ruleta: suena una lotería unos 3 segundos, elige un contacto
+  al azar de la agenda, lo selecciona y dice a quién le tocó. Con firmware viejo la ruleta la hace la web
+  (`src/lib/roulette.ts`); el firmware nuevo la hace solo y avisa con `localRoulette` en el heartbeat.
 - El ESP32 baja a memoria el próximo mensaje apenas llega (o el último
   escuchado, para repetirlo), así el botón recibir arranca al instante sin
   esperar la descarga. Apretarlo durante el aviso de voz corta el aviso y pasa
@@ -109,7 +113,7 @@ en el archivo local de secretos del firmware.
 - `GET /api/device/names/:slot`: entrega el nombre hablado de un botón de agenda.
 - `/api/settings/names/:id`: escucha, graba o borra el nombre de un contacto.
 - `POST /api/outbox/release`: libera el próximo mensaje para Chapu, o repite uno
-  al azar de los últimos 5 escuchados si no hay nuevos; lo usan el botón recibir de la caja y el de
+  al azar de ayer y hoy (o un mensaje inventado) si no hay nuevos; lo usan el botón recibir de la caja y el de
   la web.
 - `/api/whatsapp/*`: autenticación, estado, lista de grupos y recepción
   mediante `wacli`.

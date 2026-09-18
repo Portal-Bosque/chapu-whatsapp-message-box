@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { availableJokes, isJokeId, jokePath } from "@/lib/jokes";
 
 export const outboxDirectory = path.join(process.cwd(), "data", "outbox");
 export const queuedDirectory = path.join(outboxDirectory, "queued");
@@ -51,13 +52,40 @@ export async function listOutboxMessages() {
   return [...queued, ...pending, ...played].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-// With nothing new waiting, the listen button replays one of the last few
-// notes heard, picked at random. The pick is made ahead of the press and kept
-// on disk so the ESP32 prefetches the same note the release then hands out.
-const REPLAY_POOL_SIZE = 5;
+// With nothing new waiting, the listen button replays a random note from
+// yesterday or today, padded with invented funny messages when those days were
+// quiet. The pick is made ahead of the press and kept on disk so the ESP32
+// prefetches the same note the release then hands out.
+const REPLAY_MIN_POOL = 5;
 const replayStatePath = path.join(outboxDirectory, "replay.json");
 
 type ReplayState = { pick?: string; lastReleased?: string };
+
+/** Notes and invented messages both go through the listen button. */
+export function isListenable(id: string) {
+  return id.startsWith("wa_") || isJokeId(id);
+}
+
+function startOfYesterday() {
+  const day = new Date();
+  day.setHours(0, 0, 0, 0);
+  day.setDate(day.getDate() - 1);
+  return day.getTime();
+}
+
+async function replayPool() {
+  const since = startOfYesterday();
+  const pool = (await listOutboxMessages())
+    .filter((message) => message.status === "played" && message.id.startsWith("wa_")
+      && Date.parse(message.createdAt) >= since)
+    .map((message) => message.id);
+  if (pool.length >= REPLAY_MIN_POOL) return pool;
+  // Rotate which invented messages fill the gap so each day sounds different.
+  const jokes = await availableJokes();
+  const offset = jokes.length > 0 ? Math.floor(Date.now() / 86400000) % jokes.length : 0;
+  const rotated = [...jokes.slice(offset), ...jokes.slice(0, offset)];
+  return [...pool, ...rotated.slice(0, REPLAY_MIN_POOL - pool.length)];
+}
 
 async function readReplayState(): Promise<ReplayState> {
   return fs.readFile(replayStatePath, "utf8")
@@ -72,14 +100,11 @@ async function writeReplayState(state: ReplayState) {
 }
 
 /**
- * The note a press replays when the queue is empty: a random one of the last
- * five heard, never the one that just played unless it is the only one.
+ * The note a press replays when the queue is empty, never the one that just
+ * played unless it is the only one.
  */
 export async function replayPick() {
-  const pool = (await listOutboxMessages())
-    .filter((message) => message.status === "played" && message.id.startsWith("wa_"))
-    .slice(0, REPLAY_POOL_SIZE) // newest first
-    .map((message) => message.id);
+  const pool = await replayPool();
   if (pool.length === 0) return null;
   const state = await readReplayState();
   if (state.pick && pool.includes(state.pick)) return state.pick;
@@ -102,7 +127,7 @@ export async function noteReleased(id: string) {
  */
 export async function nextMessageForDevice() {
   const notes = (await listOutboxMessages())
-    .filter((message) => message.id.startsWith("wa_"))
+    .filter((message) => isListenable(message.id))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const queued = notes.find((message) => message.status === "queued");
   if (queued) return queued.id;
@@ -114,8 +139,10 @@ export async function nextMessageForDevice() {
 }
 
 export async function findOutboxWave(id: string) {
-  for (const directory of [queuedDirectory, pendingDirectory, playedDirectory]) {
-    const filePath = path.join(directory, `${id}.wav`);
+  const candidates = isJokeId(id)
+    ? [path.join(pendingDirectory, `${id}.wav`), jokePath(id)]
+    : [queuedDirectory, pendingDirectory, playedDirectory].map((directory) => path.join(directory, `${id}.wav`));
+  for (const filePath of candidates) {
     try {
       await fs.access(filePath);
       return filePath;
