@@ -20,13 +20,19 @@ export async function readDeviceHeartbeat(): Promise<DeviceHeartbeat | null> {
     return JSON.parse(await fs.readFile(deviceStatusPath, "utf8")) as DeviceHeartbeat;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    // A truncated or half-written file (power cut mid-write) must not take the
+    // heartbeat down with it: treat it as "never seen" and let the next write heal it.
+    if (error instanceof SyntaxError) return null;
     throw error;
   }
 }
 
 export async function writeDeviceHeartbeat(heartbeat: DeviceHeartbeat) {
   await fs.mkdir(path.dirname(deviceStatusPath), { recursive: true });
-  await fs.writeFile(deviceStatusPath, JSON.stringify(heartbeat), "utf8");
+  // Written every second: rename so a crash never leaves an empty file behind.
+  const temporaryPath = `${deviceStatusPath}.${process.pid}.tmp`;
+  await fs.writeFile(temporaryPath, JSON.stringify(heartbeat), "utf8");
+  await fs.rename(temporaryPath, deviceStatusPath);
 }
 
 export function heartbeatAgeMs(heartbeat: DeviceHeartbeat | null) {

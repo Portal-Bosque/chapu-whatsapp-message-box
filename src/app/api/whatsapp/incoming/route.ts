@@ -105,6 +105,7 @@ async function processIncomingAudio(message: Required<Pick<IncomingMessage, "Cha
   const waveTempPath = path.join(incomingDirectory, `${safeId}.wav.tmp`);
   const outboxId = `wa_${safeId}`;
   const outboxPath = path.join(queuedDirectory, `${outboxId}.wav`);
+  let queued = true;
 
   try {
     await appendEvent("whatsapp", `Descargando nota de voz de ${senderLabel}`);
@@ -133,20 +134,27 @@ async function processIncomingAudio(message: Required<Pick<IncomingMessage, "Cha
       ...(partial ? { partial } : {}),
     }, null, 2));
     await appendEvent("device", `Nota de voz de ${senderLabel} guardada en la cola de Chapu`);
+  } catch (error) {
+    const detail = wacliErrorText(error);
+    await fs.writeFile(markerPath, JSON.stringify({ status: "error", detail, updatedAt: new Date().toISOString() }, null, 2));
+    await appendEvent("error", `No se pudo preparar el audio entrante: ${detail}`);
+    queued = false;
+  } finally {
+    await Promise.all([
+      fs.rm(sourcePath, { force: true }),
+      fs.rm(waveTempPath, { force: true }),
+    ]);
+  }
+  if (!queued) return;
+  // The note is safely queued; a failure here must not mark it as an error.
+  try {
     // Aim the agenda at whoever wrote, so the send button answers them.
     await selectSenderRecipient(sender?.id, `Mensaje de ${senderLabel}`);
     // The arrival cue plays right away at any hour; the 1/10/60-minute
     // reminders and the boot cue respect the waking window.
     await sendReminderCue("mensaje nuevo", { force: true, ignoreWindow: true, sender });
   } catch (error) {
-    const detail = wacliErrorText(error);
-    await fs.writeFile(markerPath, JSON.stringify({ status: "error", detail, updatedAt: new Date().toISOString() }, null, 2));
-    await appendEvent("error", `No se pudo preparar el audio entrante: ${detail}`);
-  } finally {
-    await Promise.all([
-      fs.rm(sourcePath, { force: true }),
-      fs.rm(waveTempPath, { force: true }),
-    ]);
+    await appendEvent("error", `La nota quedó en la cola pero falló el aviso: ${error instanceof Error ? error.message.split("\n")[0] : "error desconocido"}`);
   }
 }
 

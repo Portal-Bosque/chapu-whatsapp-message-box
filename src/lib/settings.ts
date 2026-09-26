@@ -58,7 +58,10 @@ export async function readSettings(): Promise<MessageBoxSettings> {
 
 export async function writeSettings(settings: MessageBoxSettings) {
   await fs.mkdir(path.dirname(settingsPath), { recursive: true });
-  await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2), "utf8");
+  // The agenda must survive a crash mid-write: never leave a truncated file.
+  const temporaryPath = `${settingsPath}.${process.pid}.tmp`;
+  await fs.writeFile(temporaryPath, JSON.stringify(settings, null, 2), "utf8");
+  await fs.rename(temporaryPath, settingsPath);
 }
 
 export async function selectRecipient(id: string) {
