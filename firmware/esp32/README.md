@@ -61,7 +61,7 @@ manda el micrófono en PCM16 mono a 16 kHz mientras reproduce lo que llega en el
 mismo formato; la web (`src/lib/live-bridge.ts`) hace de puente con el modelo.
 Por defecto usa la suscripción de ChatGPT con la que está logueado el Codex CLI
 de la máquina: levanta `codex app-server` y se conecta por WebRTC a
-`gpt-live-1-codex` (voz en `CODEX_LIVE_VOICE`, por defecto `cove`). Con
+`gpt-live-1-codex` (voz en `CODEX_LIVE_VOICE`, por defecto `sol`). Con
 `LIVE_PROVIDER=openai` usa la API de OpenAI con `OPENAI_API_KEY`, que se cobra
 por minuto (voz en `OPENAI_LIVE_VOICE`). La cancelación de eco es la del EMEET.
 La web corta la sesión a los 10 minutos o tras 2 minutos sin que nadie hable

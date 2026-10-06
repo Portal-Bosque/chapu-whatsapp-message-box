@@ -388,7 +388,7 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
       transport: { type: "webrtc", sdp: peer.localDescription?.sdp },
       outputModality: "audio",
       version: "v3",
-      voice: process.env.CODEX_LIVE_VOICE || "cove",
+      voice: process.env.CODEX_LIVE_VOICE || "sol",
       model: process.env.CODEX_LIVE_MODEL || "gpt-live-1-codex",
       initialItems: [{ role: "developer", text: INSTRUCTIONS }],
     });
