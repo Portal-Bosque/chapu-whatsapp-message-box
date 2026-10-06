@@ -93,6 +93,7 @@ static volatile int s_pending_slot_press = -1;   // agenda press not yet confirm
 static volatile bool s_slot_configured[AGENDA_SLOTS] = {false};
 static volatile int s_queued_messages = 0;       // WhatsApp notes waiting for the listen button
 static volatile bool s_listen_requested = false;
+static volatile bool s_listen_rewind = false;    // the request starts over from the newest note
 static volatile bool s_status_dirty = false;
 
 // Roulette spin: the winner is drawn when the button is pressed and the lamps
@@ -381,7 +382,8 @@ static void handle_send_button(void)
     }
 }
 
-static void handle_listen_button(void)
+// `rewind` is the held button: start over from the newest note.
+static void handle_listen_button(bool rewind)
 {
     if (s_remote_playing && s_remote_is_notification) {
         // Pressing during the "new message" cue means "just play it".
@@ -389,7 +391,7 @@ static void handle_listen_button(void)
     } else if (s_remote_playing) {
         // Pressing over a note skips to the next one. A second press right after
         // the one that started it is a bounce or a double tap, not a skip.
-        if (xTaskGetTickCount() - s_remote_started_at < pdMS_TO_TICKS(LISTEN_SKIP_AFTER_MS)) {
+        if (!rewind && xTaskGetTickCount() - s_remote_started_at < pdMS_TO_TICKS(LISTEN_SKIP_AFTER_MS)) {
             ESP_LOGI(TAG, "Listen button ignored: the note has only just started");
             return;
         }
@@ -406,6 +408,10 @@ static void handle_listen_button(void)
     } else {
         // With nothing queued the web replays a random recent note.
         ESP_LOGI(TAG, "Listen button: asking the web for the next message (%d queued)", s_queued_messages);
+    }
+    if (rewind) {
+        ESP_LOGI(TAG, "Listen button held: starting over from the newest message");
+        s_listen_rewind = true;
     }
     s_listen_requested = true;
     if (s_remote_task_handle != NULL) {
@@ -646,6 +652,9 @@ static void panel_task(void *arg)
     // The send button doubles as the live-mode button: a short press starts a
     // recording on release, a press held for LIVE_HOLD_MS starts a conversation.
     bool send_armed = false;
+    // Same for the listen button: a short press plays the next note on release,
+    // a held press starts over from the newest one.
+    bool listen_armed = false;
 
     for (int i = 0; i < BUTTON_COUNT; i++) {
         raw_level[i] = gpio_get_level(s_button_gpios[i]);
@@ -671,6 +680,9 @@ static void panel_task(void *arg)
                 if (i == BUTTON_SEND && send_armed) {
                     send_armed = false;
                     handle_send_button();
+                } else if (i == BUTTON_LISTEN && listen_armed) {
+                    listen_armed = false;
+                    handle_listen_button(false);
                 }
                 continue; // release
             }
@@ -685,7 +697,7 @@ static void panel_task(void *arg)
                     send_armed = true;
                 }
             } else if (i == BUTTON_LISTEN) {
-                handle_listen_button();
+                listen_armed = true;
             } else if (i == BUTTON_ROULETTE) {
                 handle_roulette_button();
             } else {
@@ -696,6 +708,11 @@ static void panel_task(void *arg)
                 (now - level_changed_at[BUTTON_SEND]) >= pdMS_TO_TICKS(LIVE_HOLD_MS)) {
             send_armed = false;
             start_live_mode(true);
+        }
+        if (listen_armed && stable_level[BUTTON_LISTEN] == 0 &&
+                (now - level_changed_at[BUTTON_LISTEN]) >= pdMS_TO_TICKS(LIVE_HOLD_MS)) {
+            listen_armed = false;
+            handle_listen_button(true);
         }
 
         if ((int32_t)(now - next_blink_toggle) >= 0) {
@@ -1924,6 +1941,10 @@ static esp_err_t release_next_message(char *released_id, size_t released_id_size
         return ESP_FAIL;
     }
     esp_http_client_set_header(client, "X-Device-ID", "message-box-esp32");
+    if (s_listen_rewind) {
+        s_listen_rewind = false;
+        esp_http_client_set_header(client, "X-Rewind", "1");
+    }
     esp_err_t result = esp_http_client_open(client, 0);
     int status = 0;
     char response[256];

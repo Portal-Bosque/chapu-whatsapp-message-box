@@ -4,7 +4,7 @@ import { NextResponse } from "next/server";
 import { appendEvent } from "@/lib/events";
 import { readIncomingMarker, selectSenderRecipient } from "@/lib/incoming";
 import { isJokeId, jokePath } from "@/lib/jokes";
-import { ensureOutboxDirectories, isListenable, noteReleased, pendingDirectory, playedDirectory, queuedDirectory, replayPick } from "@/lib/outbox";
+import { advanceRewind, ensureOutboxDirectories, isListenable, noteReleased, pendingDirectory, playedDirectory, queuedDirectory, replayPick, rewindHead, startRewind } from "@/lib/outbox";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,6 +36,29 @@ export async function POST(request: Request) {
   }
 
   const source = fromDevice ? "Botón físico recibir" : "Botón escuchar de la web";
+
+  // Holding the listen button starts over from the newest note; the presses
+  // that follow walk back through the older ones before anything else plays.
+  const rewindRequested = request.headers.get("x-rewind") === "1";
+  if (rewindRequested) await startRewind();
+  const rewinding = await rewindHead();
+  if (rewinding) {
+    try {
+      await fs.rename(path.join(rewinding.directory, `${rewinding.id}.wav`), path.join(pendingDirectory, `${rewinding.id}.wav`));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return NextResponse.json({ error: "La cola cambió; probá nuevamente" }, { status: 409 });
+      }
+      throw error;
+    }
+    await advanceRewind(rewinding.id);
+    await noteReleased(rewinding.id);
+    await appendEvent("device", rewindRequested
+      ? `${source} mantenido: vuelve a empezar desde el mensaje más nuevo`
+      : `${source}: sigue el repaso con el mensaje anterior`);
+    await selectSender(rewinding.id);
+    return NextResponse.json({ id: rewinding.id, status: "pending", replay: true, remaining: 0 });
+  }
   const queued = await orderedWaveFiles(queuedDirectory);
   const next = queued[0];
 

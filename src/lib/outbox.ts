@@ -59,7 +59,11 @@ export async function listOutboxMessages() {
 const REPLAY_MIN_POOL = 5;
 const replayStatePath = path.join(outboxDirectory, "replay.json");
 
-type ReplayState = { pick?: string; lastReleased?: string };
+// `playlist` is the rewind the held listen button starts: the notes of
+// yesterday and today, newest first, handed out one per press.
+type ReplayState = { pick?: string; lastReleased?: string; playlist?: string[]; playlistAt?: number };
+// A rewind nobody continues is forgotten, so a press hours later starts fresh.
+const PLAYLIST_IDLE_MS = 15 * 60 * 1000;
 
 /** Notes and invented messages both go through the listen button. */
 export function isListenable(id: string) {
@@ -117,7 +121,45 @@ export async function replayPick() {
 
 /** Records the note handed to Chapu so the next random pick is a different one. */
 export async function noteReleased(id: string) {
-  await writeReplayState({ lastReleased: id });
+  const { playlist, playlistAt } = await readReplayState();
+  await writeReplayState({ lastReleased: id, ...(playlist?.length ? { playlist, playlistAt } : {}) });
+}
+
+/** Starts over from the newest note of yesterday and today, heard or not. */
+export async function startRewind() {
+  const since = startOfYesterday();
+  const playlist = (await listOutboxMessages())
+    .filter((message) => message.id.startsWith("wa_") && message.status !== "pending"
+      && Date.parse(message.createdAt) >= since)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .map((message) => message.id);
+  await writeReplayState({ ...(await readReplayState()), playlist, playlistAt: Date.now() });
+  return playlist.length;
+}
+
+/** The next note of a rewind in progress and the folder it waits in, or null. */
+export async function rewindHead() {
+  const state = await readReplayState();
+  if (!state.playlist?.length || Date.now() - (state.playlistAt ?? 0) > PLAYLIST_IDLE_MS) return null;
+  for (const id of state.playlist) {
+    for (const directory of [queuedDirectory, playedDirectory]) {
+      try {
+        await fs.access(path.join(directory, `${id}.wav`));
+        return { id, directory };
+      } catch {
+        // Not in this folder.
+      }
+    }
+  }
+  return null;
+}
+
+/** Drops a note (and any that vanished before it) from the rewind once it is handed out. */
+export async function advanceRewind(id: string) {
+  const state = await readReplayState();
+  const index = state.playlist?.indexOf(id) ?? -1;
+  if (index < 0) return;
+  await writeReplayState({ ...state, playlist: state.playlist!.slice(index + 1), playlistAt: Date.now() });
 }
 
 /**
@@ -126,6 +168,8 @@ export async function noteReleased(id: string) {
  * it ahead of time so a press starts playing at once.
  */
 export async function nextMessageForDevice() {
+  const rewinding = await rewindHead();
+  if (rewinding) return rewinding.id;
   const notes = (await listOutboxMessages())
     .filter((message) => isListenable(message.id))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
