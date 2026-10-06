@@ -297,6 +297,8 @@ static int16_t *s_start_chime_pcm = NULL;
 static size_t s_start_chime_pcm_size = 0;
 static int16_t *s_stop_chime_pcm = NULL;
 static size_t s_stop_chime_pcm_size = 0;
+static int16_t *s_live_chime_pcm = NULL;     // "level up" jingle that opens live mode
+static size_t s_live_chime_pcm_size = 0;
 static int16_t *s_agenda_chime_pcm = NULL;   // short blip confirming an agenda press
 static size_t s_agenda_chime_pcm_size = 0;
 #ifndef CONFIG_EXAMPLE_MIC_PLAYBACK
@@ -873,7 +875,11 @@ static void live_task(void *arg)
 {
     static uint8_t input[LIVE_FRAME_BYTES + 1];
     static int16_t output[(LIVE_FRAME_BYTES / 2) * 3 * 2]; // stereo 48 kHz
-    live_play_chime(s_start_chime_pcm, s_start_chime_pcm_size);
+    if (s_live_chime_pcm != NULL) {
+        live_play_chime(s_live_chime_pcm, s_live_chime_pcm_size);
+    } else {
+        live_play_chime(s_start_chime_pcm, s_start_chime_pcm_size);
+    }
 
     int sock = live_connect();
     if (sock >= 0 && !s_live_stop_request && s_mic_dev_handle != NULL) {
@@ -991,6 +997,41 @@ static void fill_blip(int16_t *pcm, uint32_t sample_rate, float hz, uint32_t dur
     }
 }
 
+// Live mode opens with a video-game "level up": a quick rising arpeggio of
+// chiptune notes (a softened square wave) that lands on a long high one.
+static const float s_live_jingle_hz[] = { 523.25f, 659.25f, 783.99f, 1046.50f, 1318.51f, 1567.98f, 2093.00f };
+#define LIVE_JINGLE_NOTES (sizeof(s_live_jingle_hz) / sizeof(s_live_jingle_hz[0]))
+#define LIVE_JINGLE_NOTE_MS 75
+#define LIVE_JINGLE_LAST_MS 280
+
+static void prepare_live_chime(uint32_t sample_rate)
+{
+    const uint32_t total_ms = LIVE_JINGLE_NOTE_MS * (LIVE_JINGLE_NOTES - 1) + LIVE_JINGLE_LAST_MS;
+    const uint32_t total_frames = sample_rate * total_ms / 1000;
+    s_live_chime_pcm_size = total_frames * 2 * sizeof(int16_t);
+    s_live_chime_pcm = heap_caps_malloc(s_live_chime_pcm_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_live_chime_pcm == NULL) {
+        s_live_chime_pcm_size = 0;
+        return; // live mode falls back to the recording chime
+    }
+    uint32_t frame = 0;
+    for (size_t note = 0; note < LIVE_JINGLE_NOTES; note++) {
+        const bool last = note == LIVE_JINGLE_NOTES - 1;
+        const uint32_t note_frames = sample_rate * (last ? LIVE_JINGLE_LAST_MS : LIVE_JINGLE_NOTE_MS) / 1000;
+        for (uint32_t i = 0; i < note_frames && frame < total_frames; i++, frame++) {
+            float progress = (float)i / (float)note_frames;
+            // Sharp attack; short notes barely decay, the last one rings out.
+            float attack = i < sample_rate / 500 ? (float)i / (float)(sample_rate / 500) : 1.0f;
+            float envelope = attack * (last ? (1.0f - progress) * (1.0f - progress) : 1.0f - 0.5f * progress);
+            float phase = 2.0f * 3.14159265f * s_live_jingle_hz[note] * i / sample_rate;
+            float square = sinf(phase) + sinf(phase * 3.0f) / 3.0f + sinf(phase * 5.0f) / 5.0f;
+            int16_t sample = (int16_t)(4500.0f * envelope * square);
+            s_live_chime_pcm[frame * 2] = sample;
+            s_live_chime_pcm[frame * 2 + 1] = sample;
+        }
+    }
+}
+
 // Lottery wheel: bright ticks that start fast and slow down over the spin,
 // cycling through a pentatonic scale, then a two-note "ta-da" on the winner.
 static void prepare_roulette_sound(uint32_t sample_rate)
@@ -1056,6 +1097,7 @@ static void prepare_recording_chimes(void)
     fill_blip(s_agenda_chime_pcm, sample_rate, 1046.50f, blip_ms);
 
     prepare_roulette_sound(sample_rate);
+    prepare_live_chime(sample_rate);
 }
 
 static void start_recording_cycle(void)
