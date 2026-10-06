@@ -45,8 +45,34 @@ Si cambia de idea en el medio, cambiá de actividad sin problema. Si no elige, p
 Backchannel policy: Usá pocos sonidos de escucha, breves, sin tapar al chico.
 
 Interruption policy: Si el chico te interrumpe, callate enseguida y escuchá.
+`;
+
+const NO_BACKEND_POLICY = `
 
 Delegation policy: No hay backend ni herramientas. Nunca delegues: respondé siempre vos con lo que sabés.`;
+
+const LOOKUP_POLICY = `
+
+Delegation policy:
+Backend tools:
+- Buscar en internet: datos actuales o precisos (clima, resultados, noticias para chicos, fechas, récords, cómo es o cuánto mide algo).
+
+Delegá al backend cuando la respuesta dependa de información actual o de un dato que no sabés con seguridad.
+No delegues para charlar, jugar a la trivia, contar cuentos o explicar cosas que ya sabés.
+Mientras esperás, avisá en pocas palabras que lo estás averiguando y no adivines el resultado.
+Cuando llegue la respuesta, contala con tus palabras, cortita y para chicos.`;
+
+// What the Codex turn that does the looking up is told. Its answer is read aloud by Chapu.
+const LOOKUP_INSTRUCTIONS = `Ayudás a Chapu, una caja parlante que charla con chicos de entre 4 y 10 años en español rioplatense.
+Te llega el final de la conversación. Respondé lo último que pidió el chico, buscando en internet si hace falta.
+Tu única herramienta es la búsqueda web: no uses la terminal, no leas ni escribas archivos, y no hables de esta computadora.
+Contestá en dos o tres oraciones cortas, con palabras simples, listas para decir en voz alta: sin listas, sin enlaces, sin emojis, sin nombres de sitios.
+Todo tiene que ser apto para chicos. Si el tema no es para chicos, o lo que encontrás es violento, sexual o da miedo, decí solo que eso es mejor charlarlo con mamá o papá.
+Si no encontrás un dato confiable, decí que no lo pudiste averiguar. No inventes.`;
+const LOOKUP_FAILED = "No se pudo averiguar ahora. Decile que no lo pudiste buscar y proponé seguir con otra cosa.";
+const LOOKUP_TIMEOUT_MS = 45_000;
+const MAX_SEARCHES_PER_SESSION = 3;
+const TRANSCRIPT_TURNS = 12;
 
 const GREETING = "Saludá ahora en español, en una frase corta y alegre, decí que sos Chapu y preguntá quién anda por ahí: ¿Dan, Chloe, Chiara? Después escuchá. Cuando te digan quién es, saludalo por su nombre y ofrecé las cuatro opciones: una trivia, aprender algo bien a fondo, un dato curioso, o charlar de lo que quiera.";
 const WRAP_UP = "Se termina el tiempo de charla. Cerrá la idea en una frase, despedite con cariño ahora y decí que para seguir hay que volver a mantener apretado el botón rojo grande.";
@@ -106,7 +132,7 @@ function openaiUpstream(handlers: UpstreamHandlers): Upstream | null {
       event_id: "start",
       session: {
         model: process.env.OPENAI_LIVE_MODEL || "gpt-live-1",
-        instructions: INSTRUCTIONS,
+        instructions: INSTRUCTIONS + NO_BACKEND_POLICY,
         audio: {
           format: { type: "audio/pcm", rate: SAMPLE_RATE },
           output: { voice: process.env.OPENAI_LIVE_VOICE || "marin" },
@@ -267,6 +293,40 @@ function codexAppServer() {
   return codexState.chapuCodex;
 }
 
+// Answers one question with an ordinary Codex turn that may search the web.
+// Each lookup gets its own throwaway thread in the empty working directory.
+async function lookUp(codex: CodexAppServer, cwd: string, conversation: string, search: boolean) {
+  const thread = await codex.request("thread/start", {
+    ephemeral: true,
+    sandbox: "read-only",
+    approvalPolicy: "never",
+    cwd,
+    developerInstructions: LOOKUP_INSTRUCTIONS,
+    config: { web_search: search ? "live" : "disabled" },
+    ...(process.env.CODEX_LOOKUP_MODEL ? { model: process.env.CODEX_LOOKUP_MODEL } : {}),
+  }) as { thread: { id: string } };
+  const lookupThreadId = thread.thread.id;
+  let text = "";
+  let searched = false;
+  const finished = new Promise<void>((resolve, reject) => {
+    const off = codex.on((method, params) => {
+      if (method === "exit") { off(); reject(new Error("Codex se cerró")); }
+      if (params.threadId !== lookupThreadId) return;
+      const item = params.item as { type?: string; text?: string; phase?: string } | undefined;
+      if (method === "item/completed" && item?.type === "webSearch") searched = true;
+      if (method === "item/completed" && item?.type === "agentMessage" && item.text) text = item.text;
+      if (method === "turn/completed") { off(); resolve(); }
+    });
+    setTimeout(() => { off(); reject(new Error("la búsqueda tardó demasiado")); }, LOOKUP_TIMEOUT_MS);
+  });
+  await codex.request("turn/start", { threadId: lookupThreadId, effort: "low", input: [{ type: "text", text: conversation }] });
+  await finished;
+  // Citation markers and emoji are for a screen, not for a voice.
+  text = text.replace(/\uE200[^\uE201]*\uE201/g, "").replace(/\p{Extended_Pictographic}/gu, "").replace(/\s+/g, " ").trim();
+  if (!text) throw new Error("Codex no devolvió texto");
+  return { text, searched };
+}
+
 // The slice of @roamhq/wrtc this bridge uses. It is a native module, loaded at
 // run time so the bundler leaves it alone.
 type AudioFrame = { samples: Int16Array; sampleRate: number; bitsPerSample?: number; channelCount?: number; numberOfFrames?: number };
@@ -301,6 +361,39 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
   let started = false;
   let ended = false;
   let pending: Buffer = Buffer.alloc(0);
+  const cwd = path.join(process.cwd(), "data", "live-codex"); // empty on purpose: Codex has nothing to read here
+  // Finished turns, so a lookup knows what the child asked for.
+  const transcript: string[] = [];
+  let lookingUp = false;
+  let searches = 0;
+  let userTurns = 0;
+  let answeredAtUserTurn = -1;
+
+  const answerDelegation = async () => {
+    // The model often asks again for what it was just told, even after the answer
+    // arrived; a second lookup would give a second, slightly different answer.
+    // One lookup per thing the child said is enough.
+    if (lookingUp || answeredAtUserTurn === userTurns) return;
+    lookingUp = true;
+    answeredAtUserTurn = userTurns;
+    // Codex hands the model an "assistant" text as the result of what it asked for.
+    const reply = (content: string) => {
+      if (threadId && !ended) {
+        void codex.request("thread/realtime/appendText", { threadId, role: "assistant", text: content.slice(0, 1000) }).catch(() => undefined);
+      }
+    };
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 500)); // the transcript trails the request slightly
+      const result = await lookUp(codex, cwd, transcript.join("\n"), searches < MAX_SEARCHES_PER_SESSION);
+      if (result.searched) searches++;
+      reply(result.text);
+    } catch (error) {
+      handlers.onError(`no se pudo averiguar: ${(error as Error).message}`);
+      reply(LOOKUP_FAILED);
+    } finally {
+      lookingUp = false;
+    }
+  };
 
   const end = () => {
     if (ended) return;
@@ -319,6 +412,11 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
     }
     if (!threadId || params.threadId !== threadId) return;
     if (method === "thread/realtime/transcript/delta" && params.role === "user") handlers.onUserSpeech();
+    if (method === "thread/realtime/transcript/done" && typeof params.text === "string") {
+      if (params.role === "user") userTurns++;
+      transcript.push(`${params.role === "user" ? "Chico" : "Chapu"}: ${params.text.trim()}`);
+      if (transcript.length > TRANSCRIPT_TURNS) transcript.shift();
+    }
     if (method === "thread/realtime/error") handlers.onError(String(params.message ?? "error de Codex"));
     if (method === "thread/realtime/error" || method === "thread/realtime/closed") end();
   });
@@ -333,6 +431,10 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
     if (event.type === "session.started" && !started) {
       started = true;
       handlers.onStarted();
+    }
+    // The model wants something looked up and waits for the answer as commentary.
+    if (event.type === "delegation.created" || event.type === "session.delegation.created") {
+      void answerDelegation();
     }
     if (event.type === "session.usage.updated" && typeof event.usage?.audio_duration_ms === "number") {
       handlers.onUsage(Math.round(event.usage.audio_duration_ms / 1000));
@@ -360,11 +462,10 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
   };
 
   void (async () => {
-    const cwd = path.join(process.cwd(), "data", "live-codex"); // empty on purpose: Codex has nothing to read here
     mkdirSync(cwd, { recursive: true });
     await codex.ready;
     const thread = await codex.request("thread/start", {
-      ephemeral: true, sandbox: "read-only", approvalPolicy: "never", developerInstructions: INSTRUCTIONS, cwd,
+      ephemeral: true, sandbox: "read-only", approvalPolicy: "never", developerInstructions: INSTRUCTIONS + LOOKUP_POLICY, cwd,
     }) as { thread: { id: string } };
     threadId = thread.thread.id;
     await peer.setLocalDescription(await peer.createOffer({ offerToReceiveAudio: true }));
@@ -390,7 +491,7 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
       version: "v3",
       voice: process.env.CODEX_LIVE_VOICE || "sol",
       model: process.env.CODEX_LIVE_MODEL || "gpt-live-1-codex",
-      initialItems: [{ role: "developer", text: INSTRUCTIONS }],
+      initialItems: [{ role: "developer", text: INSTRUCTIONS + LOOKUP_POLICY }],
     });
     if (ended) return;
     await peer.setRemoteDescription({ type: "answer", sdp: await answer });
