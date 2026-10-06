@@ -67,4 +67,5 @@ next-env.d.ts
 /data/notifications/
 /data/names/
 /firmware/esp32/bins/
+/firmware/esp32/backups/
 /scripts/deploy-mini.env

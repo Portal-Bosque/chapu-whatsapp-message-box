@@ -5,6 +5,10 @@ export async function register() {
   const { startReminderScheduler } = await import("@/lib/reminders");
   startReminderScheduler();
 
+  // TCP bridge the ESP32 streams through while it talks with gpt-live-1.
+  const { startLiveBridge } = await import("@/lib/live-bridge");
+  startLiveBridge();
+
   // Start listening for WhatsApp notes even if nobody opens the web panel;
   // the sync webhook always points at this same server.
   const { ensureWacliSync } = await import("@/lib/wacli");

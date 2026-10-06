@@ -24,7 +24,7 @@ microswitch y otro para la lámpara.
 | Agenda 1  | GPIO 15          | GPIO 16         | Fija cuando es el destinatario elegido                |
 | Agenda 2  | GPIO 17          | GPIO 18         | Fija cuando es el destinatario elegido                |
 | Agenda 3  | GPIO 10          | GPIO 11         | Fija cuando es el destinatario elegido                |
-| Ruleta    | GPIO 12          | GPIO 13         | Gira y elige un contacto al azar; fija si sale el 4.º  |
+| Ruleta    | GPIO 12          | GPIO 13         | Gira y elige un contacto al azar; titila en modo charla |
 
 Microswitch: `COM` a `GND` y `NO` al GPIO del botón. El firmware activa el
 pull-up interno, así que una pulsación se lee en bajo. No hace falta resistencia.
@@ -47,6 +47,24 @@ La agenda se configura desde la web: el botón 1 es el primer contacto de la
 lista, el 2 el segundo y así hasta el cuarto. Al apretar un botón de agenda el
 ESP32 lo informa en el próximo heartbeat y la web cambia el destinatario; si la
 web cambia el destinatario, la lámpara sigue a la web.
+
+## Modo charla
+
+Mantener apretado el botón de la ruleta más de un segundo abre una conversación
+hablada con `gpt-live-1` de OpenAI: Chapu saluda y ofrece una trivia, aprender
+algo a fondo, un dato curioso o charlar. Un toque corto sigue siendo la ruleta
+(ahora gira al soltar). Otro toque del mismo botón termina la charla.
+
+El ESP32 abre un socket TCP a `MESSAGE_BOX_LIVE_HOST:MESSAGE_BOX_LIVE_PORT` y
+manda el micrófono en PCM16 mono a 16 kHz mientras reproduce lo que llega en el
+mismo formato; la web (`src/lib/live-bridge.ts`) hace de puente con OpenAI y
+guarda la clave (`OPENAI_API_KEY` en `.env.local`). La cancelación de eco es la
+del EMEET. La web corta la sesión a los 10 minutos o tras 2 minutos sin que
+nadie hable (`OPENAI_LIVE_MAX_MINUTES`, `OPENAI_LIVE_IDLE_MINUTES`); la voz se
+elige con `OPENAI_LIVE_VOICE`.
+
+Para probar sin el botón: `POST /api/device/live` con `{"action":"start"}` o
+`{"action":"stop"}`.
 
 ## Particiones
 

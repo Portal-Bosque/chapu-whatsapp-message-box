@@ -6,6 +6,8 @@ export type DeviceHeartbeat = {
   microphone: boolean;
   recording: boolean;
   playing: boolean;
+  // A spoken conversation with gpt-live-1 is open (roulette button held).
+  live?: boolean;
   // Firmware that spins the roulette itself says so; older firmware leaves it to the web.
   localRoulette?: boolean;
   lastSeenAt: string;

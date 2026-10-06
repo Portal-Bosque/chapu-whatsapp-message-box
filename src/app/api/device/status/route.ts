@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { DEVICE_ONLINE_WINDOW_MS, heartbeatAgeMs, readDeviceHeartbeat, writeDeviceHeartbeat, type DeviceHeartbeat } from "@/lib/device";
 import { appendEvent } from "@/lib/events";
+import { takeLiveCommand } from "@/lib/live-bridge";
 import { slotNameVersions } from "@/lib/names";
 import { listOutboxMessages, nextMessageForDevice } from "@/lib/outbox";
 import { sendReminderCue } from "@/lib/reminders";
@@ -33,6 +34,8 @@ async function panelState(webRoulette: boolean) {
     next: await nextMessageForDevice(),
     // Lets the ESP32 announce itself only once it can really send and receive.
     whatsappReady: await isWhatsappReady(),
+    // One-shot order from the web to start or stop live mode.
+    liveCommand: takeLiveCommand() ?? null,
   };
 }
 
@@ -49,6 +52,7 @@ export async function POST(request: Request) {
     microphone: body.microphone,
     recording: body.recording === true,
     playing: body.playing === true,
+    ...(body.live === true ? { live: true } : {}),
     ...(body.localRoulette === true ? { localRoulette: true } : {}),
     lastSeenAt: new Date().toISOString(),
   };
@@ -91,6 +95,7 @@ export async function GET() {
       microphone: espConnected && heartbeat.microphone,
       recording: espConnected && heartbeat.recording,
       playing: espConnected && heartbeat.playing === true,
+      live: espConnected && heartbeat.live === true,
       functional: espConnected && heartbeat.speaker && heartbeat.microphone,
       lastSeenAt: heartbeat.lastSeenAt,
       ageMs,
@@ -102,6 +107,7 @@ export async function GET() {
     microphone: false,
     recording: false,
     playing: false,
+    live: false,
     functional: false,
     lastSeenAt: null,
     ageMs: null,

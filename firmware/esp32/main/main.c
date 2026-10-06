@@ -9,11 +9,13 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <errno.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/stream_buffer.h"
 #include "esp_err.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -25,6 +27,7 @@
 #include "esp_wifi.h"
 #include "driver/gpio.h"
 #include "nvs_flash.h"
+#include "lwip/sockets.h"
 #include "usb/usb_host.h"
 #include "usb/uac_host.h"
 #include "cJSON.h"
@@ -101,6 +104,22 @@ static uint16_t s_roulette_tick_ms[ROULETTE_MAX_TICKS];
 static int s_roulette_tick_count = 0;
 static int16_t *s_roulette_pcm = NULL;
 static size_t s_roulette_pcm_size = 0;
+
+// Live mode: holding the roulette button opens a spoken conversation with
+// gpt-live-1. The microphone and the speaker stream at the same time through a
+// plain TCP socket to the bridge the web runs (raw PCM16 mono 16 kHz each way),
+// and the EMEET's own echo cancellation keeps the model from hearing itself.
+#define LIVE_HOLD_MS 1000
+#define LIVE_FRAME_BYTES 640                 // 20 ms of PCM16 mono 16 kHz
+#define LIVE_MIC_STREAM_BYTES 16000          // half a second of microphone backlog
+#define LIVE_SILENCE_TIMEOUT_MS 20000        // the bridge streams continuously once it starts
+static volatile bool s_live_active = false;
+static volatile bool s_live_stop_request = false;
+static volatile bool s_live_streaming = false;   // microphone samples go to the socket
+static volatile bool s_live_uplink_running = false;
+static volatile int s_live_sock = -1;
+static StreamBufferHandle_t s_live_mic_stream = NULL;
+static uint32_t s_mic_channels = 1;
 
 // Spoken contact names, one per agenda slot, downloaded from the web and kept
 // in PSRAM so a press answers immediately. The web reports a version string per
@@ -536,6 +555,50 @@ static void handle_roulette_button(void)
     }
 }
 
+static void live_task(void *arg);
+
+// `interrupt_playback` is for the held button: holding it over a WhatsApp note
+// or a cue means "talk to me now", so whatever is on the speaker is cut.
+static void start_live_mode(bool interrupt_playback)
+{
+    if (!s_wifi_ready || s_spk_dev_handle == NULL || s_mic_dev_handle == NULL) {
+        ESP_LOGW(TAG, "Live mode ignored: Wi-Fi or EMEET is not ready");
+        return;
+    }
+    if (interrupt_playback && !s_emeet_cycle_active && (s_remote_playing || s_play_task_handle != NULL)) {
+        ESP_LOGI(TAG, "Live mode: cutting the audio on the speaker");
+        s_roulette_winner = -1;
+        s_stop_play_request = true;
+        // A note also has to be acknowledged by the remote task before it counts as over.
+        for (int i = 0; i < 300 && (s_play_task_handle != NULL || s_remote_playing); i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        s_stop_play_request = false;
+    }
+    if (s_emeet_cycle_active || s_remote_playing || !make_room_for_cue()) {
+        ESP_LOGW(TAG, "Live mode ignored: audio is busy");
+        return;
+    }
+    if (s_live_mic_stream == NULL) {
+        s_live_mic_stream = xStreamBufferCreate(LIVE_MIC_STREAM_BYTES, LIVE_FRAME_BYTES);
+        if (s_live_mic_stream == NULL) {
+            ESP_LOGE(TAG, "Live mode could not allocate the microphone stream");
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "Live mode starting");
+    // The recording flag keeps every other sound and the other buttons away.
+    s_emeet_cycle_active = true;
+    s_live_stop_request = false;
+    s_live_active = true;
+    s_status_dirty = true;
+    if (xTaskCreatePinnedToCore(live_task, "live", 6144, NULL, USER_TASK_PRIORITY + 1, NULL, 1) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to create the live task");
+        s_live_active = false;
+        s_emeet_cycle_active = false;
+    }
+}
+
 static led_mode_t desired_led_mode(int button)
 {
     switch (button) {
@@ -548,6 +611,9 @@ static led_mode_t desired_led_mode(int button)
         return s_queued_messages > 0 ? LED_BLINK : LED_OFF;
     default: {
         int slot = button - BUTTON_AGENDA_FIRST;
+        if (s_live_active && button == BUTTON_ROULETTE) {
+            return LED_BLINK;
+        }
         if (s_roulette_spinning) {
             // One lamp at a time, timed so the last tick lights the winner.
             int ticks_left = s_roulette_tick_count - 1 - roulette_current_tick();
@@ -567,6 +633,9 @@ static void panel_task(void *arg)
     TickType_t now = xTaskGetTickCount();
     TickType_t next_blink_toggle = now;
     bool blink_phase = false;
+    // The roulette button doubles as the live-mode button: a short press spins
+    // on release, a press held for LIVE_HOLD_MS starts a conversation.
+    bool roulette_armed = false;
 
     for (int i = 0; i < BUTTON_COUNT; i++) {
         raw_level[i] = gpio_get_level(s_button_gpios[i]);
@@ -589,6 +658,10 @@ static void panel_task(void *arg)
             }
             stable_level[i] = raw_level[i];
             if (stable_level[i] != 0) {
+                if (i == BUTTON_ROULETTE && roulette_armed) {
+                    roulette_armed = false;
+                    handle_roulette_button();
+                }
                 continue; // release
             }
             ESP_LOGD(TAG, "Button %s pressed", s_button_names[i]);
@@ -597,10 +670,20 @@ static void panel_task(void *arg)
             } else if (i == BUTTON_LISTEN) {
                 handle_listen_button();
             } else if (i == BUTTON_ROULETTE) {
-                handle_roulette_button();
+                if (s_live_active) {
+                    ESP_LOGI(TAG, "Roulette button: ending live mode");
+                    s_live_stop_request = true;
+                } else {
+                    roulette_armed = true;
+                }
             } else {
                 handle_agenda_button(i - BUTTON_AGENDA_FIRST);
             }
+        }
+        if (roulette_armed && stable_level[BUTTON_ROULETTE] == 0 &&
+                (now - level_changed_at[BUTTON_ROULETTE]) >= pdMS_TO_TICKS(LIVE_HOLD_MS)) {
+            roulette_armed = false;
+            start_live_mode(true);
         }
 
         if ((int32_t)(now - next_blink_toggle) >= 0) {
@@ -720,6 +803,156 @@ static esp_err_t start_pcm_playback(player_config_t *config)
         }
     }
     return ESP_OK;
+}
+
+static void live_uplink_task(void *arg)
+{
+    static uint8_t frame[LIVE_FRAME_BYTES * 2];
+    while (s_live_streaming) {
+        size_t size = xStreamBufferReceive(s_live_mic_stream, frame, sizeof(frame), pdMS_TO_TICKS(100));
+        size_t sent = 0;
+        while (sent < size && s_live_streaming) {
+            int written = send(s_live_sock, frame + sent, size - sent, 0);
+            if (written <= 0) {
+                ESP_LOGW(TAG, "Live mode: microphone send failed (errno %d)", errno);
+                s_live_stop_request = true;
+                break;
+            }
+            sent += (size_t)written;
+        }
+    }
+    s_live_uplink_running = false;
+    vTaskDelete(NULL);
+}
+
+// Plays one of the short chimes and waits until the speaker is free again.
+static void live_play_chime(const int16_t *pcm, size_t pcm_size)
+{
+    player_config_t chime = {
+        .pcm_ptr = (const uint8_t *)pcm,
+        .pcm_size = pcm_size,
+    };
+    if (pcm == NULL || s_spk_dev_handle == NULL || start_pcm_playback(&chime) != ESP_OK) {
+        return;
+    }
+    for (int i = 0; i < 300 && s_play_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static int live_connect(void)
+{
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(MESSAGE_BOX_LIVE_PORT),
+    };
+    if (inet_pton(AF_INET, MESSAGE_BOX_LIVE_HOST, &address.sin_addr) != 1) {
+        return -1;
+    }
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        return -1;
+    }
+    // Short receive timeout so the loop notices the button; the send timeout
+    // only bounds a stalled network.
+    struct timeval receive_timeout = { .tv_sec = 0, .tv_usec = 200 * 1000 };
+    struct timeval send_timeout = { .tv_sec = 3, .tv_usec = 0 };
+    int no_delay = 1;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
+    if (connect(sock, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        ESP_LOGW(TAG, "Live mode: could not reach the bridge (errno %d)", errno);
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+static void live_task(void *arg)
+{
+    static uint8_t input[LIVE_FRAME_BYTES + 1];
+    static int16_t output[(LIVE_FRAME_BYTES / 2) * 3 * 2]; // stereo 48 kHz
+    live_play_chime(s_start_chime_pcm, s_start_chime_pcm_size);
+
+    int sock = live_connect();
+    if (sock >= 0 && !s_live_stop_request && s_mic_dev_handle != NULL) {
+        s_live_sock = sock;
+        vTaskDelay(pdMS_TO_TICKS(RECORDING_CHIME_SETTLE_MS));
+        xStreamBufferReset(s_live_mic_stream);
+        s_live_streaming = true;
+        s_live_uplink_running = true;
+        if (xTaskCreatePinnedToCore(live_uplink_task, "live_up", 4096, NULL, USER_TASK_PRIORITY + 1, NULL, 1) != pdTRUE) {
+            s_live_uplink_running = false;
+            s_live_stop_request = true;
+        } else if (uac_host_device_resume(s_mic_dev_handle) != ESP_OK) {
+            ESP_LOGE(TAG, "Live mode: failed to resume MIC device");
+            s_live_stop_request = true;
+        } else {
+            ESP_LOGI(TAG, "Live mode streaming");
+        }
+
+        size_t carry = 0;       // odd byte left over from the previous read
+        int32_t previous = 0;   // last sample, for the interpolation across reads
+        TickType_t last_audio_at = xTaskGetTickCount();
+        while (!s_live_stop_request && s_spk_dev_handle != NULL && s_mic_dev_handle != NULL) {
+            int received = recv(sock, input + carry, LIVE_FRAME_BYTES, 0);
+            if (received == 0) {
+                ESP_LOGI(TAG, "Live mode: the bridge ended the conversation");
+                break;
+            }
+            if (received < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    ESP_LOGW(TAG, "Live mode: receive failed (errno %d)", errno);
+                    break;
+                }
+                if (xTaskGetTickCount() - last_audio_at > pdMS_TO_TICKS(LIVE_SILENCE_TIMEOUT_MS)) {
+                    ESP_LOGW(TAG, "Live mode: the bridge went silent");
+                    break;
+                }
+                continue;
+            }
+            last_audio_at = xTaskGetTickCount();
+            size_t total = carry + (size_t)received;
+            size_t samples = total / sizeof(int16_t);
+            size_t output_index = 0;
+            for (size_t i = 0; i < samples; i++) {
+                // 16 kHz mono to 48 kHz stereo with a straight line between samples.
+                int32_t sample = (int16_t)(input[i * 2] | (input[i * 2 + 1] << 8));
+                for (int step = 1; step <= 3; step++) {
+                    int16_t value = (int16_t)(previous + (sample - previous) * step / 3);
+                    output[output_index++] = value;
+                    output[output_index++] = value;
+                }
+                previous = sample;
+            }
+            carry = total % sizeof(int16_t);
+            if (carry) {
+                input[0] = input[total - 1];
+            }
+            if (output_index > 0 && s_spk_dev_handle != NULL) {
+                uac_host_device_write(s_spk_dev_handle, (uint8_t *)output, output_index * sizeof(int16_t), 1000);
+            }
+        }
+    }
+
+    s_live_streaming = false;
+    if (s_mic_dev_handle != NULL) {
+        uac_host_device_suspend(s_mic_dev_handle);
+    }
+    for (int i = 0; i < 400 && s_live_uplink_running; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (sock >= 0) {
+        close(sock);
+    }
+    s_live_sock = -1;
+    ESP_LOGI(TAG, "Live mode ended");
+    live_play_chime(s_stop_chime_pcm, s_stop_chime_pcm_size);
+    s_emeet_cycle_active = false;
+    s_live_active = false;
+    s_status_dirty = true;
+    vTaskDelete(NULL);
 }
 
 static void fill_playful_chime(int16_t *pcm, uint32_t sample_rate, float first_hz, float second_hz)
@@ -1224,6 +1457,14 @@ static void apply_panel_state(const char *json, size_t json_size)
             strlcpy(s_slot_names[i].version, version, sizeof(s_slot_names[i].version));
         }
     }
+    const cJSON *live_command = cJSON_GetObjectItemCaseSensitive(root, "liveCommand");
+    if (cJSON_IsString(live_command)) {
+        if (strcmp(live_command->valuestring, "start") == 0 && !s_live_active) {
+            start_live_mode(false); // this task acknowledges notes, so it cannot wait for one to end
+        } else if (strcmp(live_command->valuestring, "stop") == 0 && s_live_active) {
+            s_live_stop_request = true;
+        }
+    }
     const cJSON *next = cJSON_GetObjectItemCaseSensitive(root, "next");
     strlcpy(s_prefetch.wanted, cJSON_IsString(next) ? next->valuestring : "", sizeof(s_prefetch.wanted));
     // Only adopt the web's selection when no newer physical press is waiting;
@@ -1242,14 +1483,15 @@ static esp_err_t publish_device_status(void)
 {
     const int pressed_slot = s_pending_slot_press;
     const bool from_roulette = s_roulette_report;
-    char payload[192];
+    char payload[256];
     int payload_size = snprintf(payload, sizeof(payload),
                                 // localRoulette: this firmware spins GPIO 12 itself, so the web must not.
-                                "{\"localRoulette\":true,\"speaker\":%s,\"microphone\":%s,\"recording\":%s,\"playing\":%s",
+                                "{\"localRoulette\":true,\"speaker\":%s,\"microphone\":%s,\"recording\":%s,\"playing\":%s,\"live\":%s",
                                 s_spk_dev_handle != NULL ? "true" : "false",
                                 s_mic_dev_handle != NULL ? "true" : "false",
                                 s_mic_recording ? "true" : "false",
-                                s_remote_playing ? "true" : "false");
+                                s_remote_playing ? "true" : "false",
+                                s_live_active ? "true" : "false");
     if (payload_size > 0 && payload_size < (int)sizeof(payload) && pressed_slot >= 0) {
         payload_size += snprintf(payload + payload_size, sizeof(payload) - payload_size,
                                  ",\"selectedSlot\":%d%s", pressed_slot,
@@ -1279,7 +1521,7 @@ static esp_err_t publish_device_status(void)
         result = ESP_FAIL;
     }
     int status = 0;
-    char response[512];
+    char response[640];
     int response_size = 0;
     if (result == ESP_OK) {
         if (esp_http_client_fetch_headers(client) < 0) {
@@ -1726,7 +1968,7 @@ static void remote_messages_task(void *arg)
                 if (result != ESP_OK && result != ESP_ERR_NOT_FOUND) {
                     ESP_LOGW(TAG, "Could not fetch the next web message: %s", esp_err_to_name(result));
                 }
-            } else if (command_result != ESP_OK) {
+            } else if (command_result != ESP_OK && command_result != ESP_ERR_NOT_FOUND) {
                 ESP_LOGW(TAG, "Could not fetch the record command: %s", esp_err_to_name(command_result));
             }
         }
@@ -2034,6 +2276,7 @@ static void uac_lib_task(void *arg)
                         .addr = addr,
                         .iface_num = iface_num,
                         .buffer_size = rx_buffer_size,
+                        .buffer_threshold = LIVE_FRAME_BYTES * 2, // 40 ms, so live mode hears with little delay
                         .callback = uac_device_callback,
                         .callback_arg = NULL,
                     };
@@ -2061,6 +2304,7 @@ static void uac_lib_task(void *arg)
                         break;
                     }
                     s_mic_dev_handle = uac_device_handle;
+                    s_mic_channels = mic_stream_config.channels;
                     if (s_mic_record_buf_size == 0) {
                         uint32_t bytes_per_sec = mic_stream_config.sample_freq * mic_stream_config.channels * mic_alt_params.subframe_size;
                         s_mic_record_buf_size = bytes_per_sec * MIC_RECORD_MAX_SECONDS;
@@ -2113,10 +2357,25 @@ static void uac_lib_task(void *arg)
                     break;
                 }
                 case UAC_HOST_DEVICE_EVENT_RX_DONE:
-                    if (s_mic_dev_handle && s_mic_record_buf && s_mic_recording) {
+                    if (s_mic_dev_handle && s_live_streaming) {
+                        static uint8_t live_mic[4800];
+                        uint32_t rx_size = 0;
+                        uac_host_device_read(s_mic_dev_handle, live_mic, sizeof(live_mic), &rx_size, 0);
+                        if (s_mic_channels == 2) {
+                            // The bridge expects mono: keep the left channel.
+                            int16_t *frames = (int16_t *)live_mic;
+                            rx_size /= 2 * sizeof(int16_t);
+                            for (uint32_t i = 0; i < rx_size; i++) {
+                                frames[i] = frames[i * 2];
+                            }
+                            rx_size *= sizeof(int16_t);
+                        }
+                        // A stalled network drops microphone audio instead of blocking USB.
+                        xStreamBufferSend(s_live_mic_stream, live_mic, rx_size, 0);
+                    } else if (s_mic_dev_handle && s_mic_record_buf && s_mic_recording) {
                         uint32_t rx_size = 0;
                         uac_host_device_read(s_mic_dev_handle, s_mic_record_buf + s_mic_record_wr, s_mic_record_buf_size - s_mic_record_wr, &rx_size, 0);
-                        ESP_LOGI(TAG, "Reading MIC %"PRIu32" bytes", rx_size);
+                        ESP_LOGD(TAG, "Reading MIC %"PRIu32" bytes", rx_size);
                         s_mic_record_wr += rx_size;
                         if (s_mic_record_wr >= s_mic_record_buf_size) {
                             if (s_spk_dev_handle != NULL) {
