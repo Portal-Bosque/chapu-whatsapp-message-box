@@ -9,6 +9,8 @@ const lanOrigins = Object.values(networkInterfaces()).flatMap((interfaces) =>
 
 const nextConfig: NextConfig = {
   allowedDevOrigins: lanOrigins,
+  // Native WebRTC peer used by the live-mode bridge.
+  serverExternalPackages: ["@roamhq/wrtc"],
 };
 
 export default nextConfig;
