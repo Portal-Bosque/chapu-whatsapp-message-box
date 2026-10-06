@@ -1,5 +1,6 @@
 import { RecordingsPanel } from "@/components/recordings-panel";
 import { FamilyPanel } from "@/components/family-panel";
+import { LiveConversations } from "@/components/live-conversations";
 
 export const dynamic = "force-dynamic";
 
@@ -29,6 +30,8 @@ export default function Home() {
       </section>
 
       <FamilyPanel />
+
+      <LiveConversations />
 
       <RecordingsPanel />
 

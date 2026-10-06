@@ -253,3 +253,18 @@ footer span:first-child { color: var(--ink); font-weight: 800; }
 .slot-mover-buttons button small { font-size: 11px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .slot-mover-buttons button.is-current { background: var(--ink); color: #fff; cursor: default; }
 .slot-mover-buttons button:not(.is-current):hover { transform: translateY(-1px); }
+
+.conversations-section { padding: 78px max(20px, calc((100vw - 1180px) / 2)) 96px; }
+.conversation-list { display: grid; gap: 18px; }
+.conversation-empty { margin: 0; color: var(--muted); }
+.conversation-card { padding: 24px 28px; border: 2px solid var(--ink); border-radius: 20px; background: var(--card); box-shadow: 8px 9px 0 rgba(24,25,22,.16); }
+.conversation-card h3 { margin: 4px 0 10px; font-size: 24px; letter-spacing: -.02em; }
+.conversation-date { margin: 0; color: var(--muted); font-size: 13px; font-weight: 700; }.conversation-date::first-letter { text-transform: uppercase; }
+.conversation-summary { margin: 0 0 14px; max-width: 78ch; line-height: 1.55; }
+.conversation-card summary { cursor: pointer; color: var(--green-dark); font-weight: 800; font-size: 14px; }
+.conversation-lines { margin: 14px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.conversation-lines li { display: grid; grid-template-columns: 64px 92px 1fr; gap: 10px; align-items: baseline; font-size: 14px; line-height: 1.45; }
+.conversation-lines time { color: var(--muted); font-family: var(--font-geist-mono), monospace; font-size: 12px; }
+.conversation-lines .is-chapu strong { color: var(--green-dark); }.conversation-lines .is-child strong { color: var(--blue); }
+.conversation-lines .is-lookup { color: var(--muted); font-style: italic; }
+@media (max-width: 640px) { .conversation-lines li { grid-template-columns: 1fr; gap: 0; } .conversation-card { padding: 20px; } }
