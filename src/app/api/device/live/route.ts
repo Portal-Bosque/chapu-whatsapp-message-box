@@ -5,7 +5,7 @@ import { requestLiveCommand } from "@/lib/live-bridge";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Starts or stops live mode on the ESP32 as if the roulette button had been held.
+// Starts or stops live mode on the ESP32 as if the send button had been held.
 export async function POST(request: Request) {
   const body = await request.json().catch(() => ({})) as { action?: string };
   if (body.action !== "start" && body.action !== "stop") {

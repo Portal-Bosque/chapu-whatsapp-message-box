@@ -19,12 +19,12 @@ microswitch y otro para la lámpara.
 
 | Botón     | Microswitch (NO) | Lámpara (señal) | Comportamiento de la lámpara                          |
 |-----------|------------------|-----------------|-------------------------------------------------------|
-| Mandar    | GPIO 4           | GPIO 5          | Titila mientras graba                                 |
+| Mandar    | GPIO 4           | GPIO 5          | Titila mientras graba; fija en modo charla            |
 | Recibir   | GPIO 6           | GPIO 7          | Titila con mensajes por escuchar, fija mientras suena |
 | Agenda 1  | GPIO 15          | GPIO 16         | Fija cuando es el destinatario elegido                |
 | Agenda 2  | GPIO 17          | GPIO 18         | Fija cuando es el destinatario elegido                |
 | Agenda 3  | GPIO 10          | GPIO 11         | Fija cuando es el destinatario elegido                |
-| Ruleta    | GPIO 12          | GPIO 13         | Gira y elige un contacto al azar; titila en modo charla |
+| Ruleta    | GPIO 12          | GPIO 13         | Gira y elige un contacto al azar; fija si sale el 4.º  |
 
 Microswitch: `COM` a `GND` y `NO` al GPIO del botón. El firmware activa el
 pull-up interno, así que una pulsación se lee en bajo. No hace falta resistencia.
@@ -50,10 +50,11 @@ web cambia el destinatario, la lámpara sigue a la web.
 
 ## Modo charla
 
-Mantener apretado el botón de la ruleta más de un segundo abre una conversación
-hablada con `gpt-live-1` de OpenAI: Chapu saluda y ofrece una trivia, aprender
-algo a fondo, un dato curioso o charlar. Un toque corto sigue siendo la ruleta
-(ahora gira al soltar). Otro toque del mismo botón termina la charla.
+Mantener apretado el botón de mandar más de un segundo abre una conversación
+hablada con `gpt-live-1` de OpenAI: Chapu pregunta quién anda por ahí y ofrece
+una trivia, aprender algo a fondo, un dato curioso o charlar. Un toque corto
+sigue grabando un mensaje (ahora empieza al soltar). Otro toque del mismo botón
+termina la charla.
 
 El ESP32 abre un socket TCP a `MESSAGE_BOX_LIVE_HOST:MESSAGE_BOX_LIVE_PORT` y
 manda el micrófono en PCM16 mono a 16 kHz mientras reproduce lo que llega en el

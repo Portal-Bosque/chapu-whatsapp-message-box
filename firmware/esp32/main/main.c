@@ -105,7 +105,7 @@ static int s_roulette_tick_count = 0;
 static int16_t *s_roulette_pcm = NULL;
 static size_t s_roulette_pcm_size = 0;
 
-// Live mode: holding the roulette button opens a spoken conversation with
+// Live mode: holding the send button opens a spoken conversation with
 // gpt-live-1. The microphone and the speaker stream at the same time through a
 // plain TCP socket to the bridge the web runs (raw PCM16 mono 16 kHz each way),
 // and the EMEET's own echo cancellation keeps the model from hearing itself.
@@ -603,7 +603,8 @@ static led_mode_t desired_led_mode(int button)
 {
     switch (button) {
     case BUTTON_SEND:
-        return s_recording_indicator ? LED_BLINK : LED_OFF;
+        // Blinks while recording; stays lit during a live conversation.
+        return s_live_active ? LED_ON : s_recording_indicator ? LED_BLINK : LED_OFF;
     case BUTTON_LISTEN:
         if (s_remote_playing && !s_remote_is_notification) {
             return LED_ON;
@@ -611,9 +612,6 @@ static led_mode_t desired_led_mode(int button)
         return s_queued_messages > 0 ? LED_BLINK : LED_OFF;
     default: {
         int slot = button - BUTTON_AGENDA_FIRST;
-        if (s_live_active && button == BUTTON_ROULETTE) {
-            return LED_BLINK;
-        }
         if (s_roulette_spinning) {
             // One lamp at a time, timed so the last tick lights the winner.
             int ticks_left = s_roulette_tick_count - 1 - roulette_current_tick();
@@ -633,9 +631,9 @@ static void panel_task(void *arg)
     TickType_t now = xTaskGetTickCount();
     TickType_t next_blink_toggle = now;
     bool blink_phase = false;
-    // The roulette button doubles as the live-mode button: a short press spins
-    // on release, a press held for LIVE_HOLD_MS starts a conversation.
-    bool roulette_armed = false;
+    // The send button doubles as the live-mode button: a short press starts a
+    // recording on release, a press held for LIVE_HOLD_MS starts a conversation.
+    bool send_armed = false;
 
     for (int i = 0; i < BUTTON_COUNT; i++) {
         raw_level[i] = gpio_get_level(s_button_gpios[i]);
@@ -658,31 +656,33 @@ static void panel_task(void *arg)
             }
             stable_level[i] = raw_level[i];
             if (stable_level[i] != 0) {
-                if (i == BUTTON_ROULETTE && roulette_armed) {
-                    roulette_armed = false;
-                    handle_roulette_button();
+                if (i == BUTTON_SEND && send_armed) {
+                    send_armed = false;
+                    handle_send_button();
                 }
                 continue; // release
             }
             ESP_LOGD(TAG, "Button %s pressed", s_button_names[i]);
             if (i == BUTTON_SEND) {
-                handle_send_button();
+                if (s_live_active) {
+                    ESP_LOGI(TAG, "Send button: ending live mode");
+                    s_live_stop_request = true;
+                } else if (s_emeet_cycle_active) {
+                    handle_send_button(); // stopping a recording must not wait for the release
+                } else {
+                    send_armed = true;
+                }
             } else if (i == BUTTON_LISTEN) {
                 handle_listen_button();
             } else if (i == BUTTON_ROULETTE) {
-                if (s_live_active) {
-                    ESP_LOGI(TAG, "Roulette button: ending live mode");
-                    s_live_stop_request = true;
-                } else {
-                    roulette_armed = true;
-                }
+                handle_roulette_button();
             } else {
                 handle_agenda_button(i - BUTTON_AGENDA_FIRST);
             }
         }
-        if (roulette_armed && stable_level[BUTTON_ROULETTE] == 0 &&
-                (now - level_changed_at[BUTTON_ROULETTE]) >= pdMS_TO_TICKS(LIVE_HOLD_MS)) {
-            roulette_armed = false;
+        if (send_armed && stable_level[BUTTON_SEND] == 0 &&
+                (now - level_changed_at[BUTTON_SEND]) >= pdMS_TO_TICKS(LIVE_HOLD_MS)) {
+            send_armed = false;
             start_live_mode(true);
         }
 
