@@ -1,7 +1,7 @@
-import { createWriteStream, type WriteStream } from "node:fs";
+import { appendFileSync, createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import net from "node:net";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdirSync } from "node:fs";
+
 import { createRequire } from "node:module";
 import path from "node:path";
 import readline from "node:readline";
@@ -62,17 +62,15 @@ No delegues para charlar, jugar a la trivia, contar cuentos o explicar cosas que
 Mientras esperás, avisá en pocas palabras que lo estás averiguando y no adivines el resultado.
 Cuando llegue la respuesta, contala con tus palabras, cortita y para chicos.`;
 
-// What the Codex turn that does the looking up is told. Its answer is read aloud by Chapu.
+// What the Codex thread that does the looking up is told. Its answer is read aloud by Chapu.
 const LOOKUP_INSTRUCTIONS = `Ayudás a Chapu, una caja parlante que charla con chicos de entre 4 y 10 años en español rioplatense.
-Te llega el final de la conversación. Respondé lo último que pidió el chico, buscando en internet si hace falta.
+Te llega lo que pidió el chico. Respondelo, buscando en internet si hace falta.
 Tu única herramienta es la búsqueda web: no uses la terminal, no leas ni escribas archivos, y no hables de esta computadora.
 Contestá en dos o tres oraciones cortas, con palabras simples, listas para decir en voz alta: sin listas, sin enlaces, sin emojis, sin nombres de sitios.
 Todo tiene que ser apto para chicos. Si el tema no es para chicos, o lo que encontrás es violento, sexual o da miedo, decí solo que eso es mejor charlarlo con mamá o papá.
 Si no encontrás un dato confiable, decí que no lo pudiste averiguar. No inventes.`;
-const LOOKUP_FAILED = "No se pudo averiguar ahora. Decile que no lo pudiste buscar y proponé seguir con otra cosa.";
-const LOOKUP_TIMEOUT_MS = 45_000;
 const MAX_SEARCHES_PER_SESSION = 3;
-const TRANSCRIPT_TURNS = 12;
+const SEARCH_LIMIT_REACHED = "Ya no se puede buscar más en internet en esta charla. No delegues más: si te piden otro dato actual, decí que por hoy no podés averiguar más y seguí con lo que sabés.";
 
 const GREETING = "Saludá ahora en español, en una frase corta y alegre, decí que sos Chapu y preguntá quién anda por ahí: ¿Dan, Chloe, Chiara? Después escuchá. Cuando te digan quién es, saludalo por su nombre y ofrecé las cuatro opciones: una trivia, aprender algo bien a fondo, un dato curioso, o charlar de lo que quiera.";
 const WRAP_UP = "Se termina el tiempo de charla. Cerrá la idea en una frase, despedite con cariño ahora y decí que para seguir hay que volver a mantener apretado el botón rojo grande.";
@@ -85,14 +83,20 @@ type Upstream = {
   close(): Promise<void>;
 };
 
+type Speaker = "child" | "chapu" | "lookup";
+
 type UpstreamHandlers = {
   onStarted(): void;
   onAudio(pcm: Buffer): void;
   onUserSpeech(): void;
+  // Text of what was said. `partial` pieces of one speaker are joined until the speaker changes.
+  onTranscript(speaker: Speaker, text: string, partial?: boolean): void;
   onUsage(seconds: number): void;
   onError(message: string): void;
   onEnded(): void;
 };
+
+export const transcriptsDirectory = path.join(process.cwd(), "data", "live-transcripts");
 
 function minutesFromEnv(name: string, fallback: number) {
   const value = Number(process.env[name]);
@@ -157,6 +161,10 @@ function openaiUpstream(handlers: UpstreamHandlers): Upstream | null {
         break;
       case "session.input_transcript.delta":
         handlers.onUserSpeech();
+        if (event.delta) handlers.onTranscript("child", event.delta, true);
+        break;
+      case "session.output_transcript.delta":
+        if (event.delta) handlers.onTranscript("chapu", event.delta, true);
         break;
       case "session.delegation.created":
         // Client delegation is the only mode without a backend bill; answer it so the model never waits.
@@ -293,40 +301,6 @@ function codexAppServer() {
   return codexState.chapuCodex;
 }
 
-// Answers one question with an ordinary Codex turn that may search the web.
-// Each lookup gets its own throwaway thread in the empty working directory.
-async function lookUp(codex: CodexAppServer, cwd: string, conversation: string, search: boolean) {
-  const thread = await codex.request("thread/start", {
-    ephemeral: true,
-    sandbox: "read-only",
-    approvalPolicy: "never",
-    cwd,
-    developerInstructions: LOOKUP_INSTRUCTIONS,
-    config: { web_search: search ? "live" : "disabled" },
-    ...(process.env.CODEX_LOOKUP_MODEL ? { model: process.env.CODEX_LOOKUP_MODEL } : {}),
-  }) as { thread: { id: string } };
-  const lookupThreadId = thread.thread.id;
-  let text = "";
-  let searched = false;
-  const finished = new Promise<void>((resolve, reject) => {
-    const off = codex.on((method, params) => {
-      if (method === "exit") { off(); reject(new Error("Codex se cerró")); }
-      if (params.threadId !== lookupThreadId) return;
-      const item = params.item as { type?: string; text?: string; phase?: string } | undefined;
-      if (method === "item/completed" && item?.type === "webSearch") searched = true;
-      if (method === "item/completed" && item?.type === "agentMessage" && item.text) text = item.text;
-      if (method === "turn/completed") { off(); resolve(); }
-    });
-    setTimeout(() => { off(); reject(new Error("la búsqueda tardó demasiado")); }, LOOKUP_TIMEOUT_MS);
-  });
-  await codex.request("turn/start", { threadId: lookupThreadId, effort: "low", input: [{ type: "text", text: conversation }] });
-  await finished;
-  // Citation markers and emoji are for a screen, not for a voice.
-  text = text.replace(/\uE200[^\uE201]*\uE201/g, "").replace(/\p{Extended_Pictographic}/gu, "").replace(/\s+/g, " ").trim();
-  if (!text) throw new Error("Codex no devolvió texto");
-  return { text, searched };
-}
-
 // The slice of @roamhq/wrtc this bridge uses. It is a native module, loaded at
 // run time so the bundler leaves it alone.
 type AudioFrame = { samples: Int16Array; sampleRate: number; bitsPerSample?: number; channelCount?: number; numberOfFrames?: number };
@@ -362,38 +336,7 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
   let ended = false;
   let pending: Buffer = Buffer.alloc(0);
   const cwd = path.join(process.cwd(), "data", "live-codex"); // empty on purpose: Codex has nothing to read here
-  // Finished turns, so a lookup knows what the child asked for.
-  const transcript: string[] = [];
-  let lookingUp = false;
   let searches = 0;
-  let userTurns = 0;
-  let answeredAtUserTurn = -1;
-
-  const answerDelegation = async () => {
-    // The model often asks again for what it was just told, even after the answer
-    // arrived; a second lookup would give a second, slightly different answer.
-    // One lookup per thing the child said is enough.
-    if (lookingUp || answeredAtUserTurn === userTurns) return;
-    lookingUp = true;
-    answeredAtUserTurn = userTurns;
-    // Codex hands the model an "assistant" text as the result of what it asked for.
-    const reply = (content: string) => {
-      if (threadId && !ended) {
-        void codex.request("thread/realtime/appendText", { threadId, role: "assistant", text: content.slice(0, 1000) }).catch(() => undefined);
-      }
-    };
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 500)); // the transcript trails the request slightly
-      const result = await lookUp(codex, cwd, transcript.join("\n"), searches < MAX_SEARCHES_PER_SESSION);
-      if (result.searched) searches++;
-      reply(result.text);
-    } catch (error) {
-      handlers.onError(`no se pudo averiguar: ${(error as Error).message}`);
-      reply(LOOKUP_FAILED);
-    } finally {
-      lookingUp = false;
-    }
-  };
 
   const end = () => {
     if (ended) return;
@@ -413,9 +356,16 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
     if (!threadId || params.threadId !== threadId) return;
     if (method === "thread/realtime/transcript/delta" && params.role === "user") handlers.onUserSpeech();
     if (method === "thread/realtime/transcript/done" && typeof params.text === "string") {
-      if (params.role === "user") userTurns++;
-      transcript.push(`${params.role === "user" ? "Chico" : "Chapu"}: ${params.text.trim()}`);
-      if (transcript.length > TRANSCRIPT_TURNS) transcript.shift();
+      handlers.onTranscript(params.role === "user" ? "child" : "chapu", params.text);
+    }
+    // When the voice model asks for a fact, Codex runs a turn on this same thread
+    // (with web search) and feeds the answer back by itself; the bridge only watches.
+    const item = params.item as { type?: string; text?: string; phase?: string } | undefined;
+    if (method === "item/completed" && item?.type === "agentMessage" && item.phase === "final_answer" && item.text) {
+      handlers.onTranscript("lookup", item.text);
+    }
+    if (method === "item/completed" && item?.type === "webSearch" && ++searches === MAX_SEARCHES_PER_SESSION) {
+      void codex.request("thread/realtime/appendText", { threadId, role: "developer", text: SEARCH_LIMIT_REACHED }).catch(() => undefined);
     }
     if (method === "thread/realtime/error") handlers.onError(String(params.message ?? "error de Codex"));
     if (method === "thread/realtime/error" || method === "thread/realtime/closed") end();
@@ -431,10 +381,6 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
     if (event.type === "session.started" && !started) {
       started = true;
       handlers.onStarted();
-    }
-    // The model wants something looked up and waits for the answer as commentary.
-    if (event.type === "delegation.created" || event.type === "session.delegation.created") {
-      void answerDelegation();
     }
     if (event.type === "session.usage.updated" && typeof event.usage?.audio_duration_ms === "number") {
       handlers.onUsage(Math.round(event.usage.audio_duration_ms / 1000));
@@ -465,7 +411,10 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
     mkdirSync(cwd, { recursive: true });
     await codex.ready;
     const thread = await codex.request("thread/start", {
-      ephemeral: true, sandbox: "read-only", approvalPolicy: "never", developerInstructions: INSTRUCTIONS + LOOKUP_POLICY, cwd,
+      // The thread is the backend that answers lookups; the voice model gets its own prompt below.
+      ephemeral: true, sandbox: "read-only", approvalPolicy: "never", developerInstructions: LOOKUP_INSTRUCTIONS, cwd,
+      config: { web_search: "live" },
+      ...(process.env.CODEX_LOOKUP_MODEL ? { model: process.env.CODEX_LOOKUP_MODEL } : {}),
     }) as { thread: { id: string } };
     threadId = thread.thread.id;
     await peer.setLocalDescription(await peer.createOffer({ offerToReceiveAudio: true }));
@@ -537,9 +486,34 @@ function runSession(socket: net.Socket) {
   let lastSpeechAt = Date.now();
   const timers: NodeJS.Timeout[] = [];
 
+  // The conversation as text, one file per session, written as it happens.
+  const startedAt = new Date();
+  const transcriptPath = path.join(transcriptsDirectory, `${startedAt.toISOString().replace(/[:.]/g, "-")}.txt`);
+  const SPEAKER_LABELS: Record<Speaker, string> = { child: "Chico", chapu: "Chapu", lookup: "(búsqueda)" };
+  let transcriptStarted = false;
+  let partial: { speaker: Speaker; text: string } | null = null;
+  const writeLine = (speaker: Speaker, text: string) => {
+    const clean = text.replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    const time = new Date().toLocaleTimeString("es-AR", { hour12: false });
+    const header = transcriptStarted ? "" : `Charla con Chapu, ${startedAt.toLocaleString("es-AR", { hour12: false })}\n\n`;
+    transcriptStarted = true;
+    try {
+      mkdirSync(transcriptsDirectory, { recursive: true });
+      appendFileSync(transcriptPath, `${header}[${time}] ${SPEAKER_LABELS[speaker]}: ${clean}\n`, "utf8");
+    } catch {
+      // A full disk must not end the conversation.
+    }
+  };
+  const flushPartial = () => {
+    if (partial) writeLine(partial.speaker, partial.text);
+    partial = null;
+  };
+
   const finish = (reason: string) => {
     if (finished) return;
     finished = true;
+    flushPartial();
     timers.forEach(clearTimeout);
     clearInterval(idleTimer);
     socket.destroy();
@@ -576,6 +550,15 @@ function runSession(socket: net.Socket) {
     },
     onUserSpeech() {
       lastSpeechAt = Date.now();
+    },
+    onTranscript(speaker, text, isPartial) {
+      if (isPartial && partial?.speaker === speaker) {
+        partial.text += text;
+        return;
+      }
+      flushPartial();
+      if (isPartial) partial = { speaker, text };
+      else writeLine(speaker, text);
     },
     onUsage(seconds) {
       usageSeconds = seconds;

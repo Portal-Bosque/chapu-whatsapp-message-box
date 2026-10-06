@@ -64,8 +64,9 @@ de la máquina: levanta `codex app-server` y se conecta por WebRTC a
 `gpt-live-1-codex` (voz en `CODEX_LIVE_VOICE`, por defecto `sol`). Con
 `LIVE_PROVIDER=openai` usa la API de OpenAI con `OPENAI_API_KEY`, que se cobra
 por minuto (voz en `OPENAI_LIVE_VOICE`). Por la suscripción Chapu también puede buscar en internet: cuando el
-modelo de voz pide un dato, el puente corre un turno de Codex con búsqueda web
-(hasta 3 búsquedas por charla) y le devuelve la respuesta. La cancelación de eco es la del EMEET.
+modelo de voz pide un dato, Codex lo resuelve en el mismo hilo con búsqueda web
+(hasta 3 búsquedas por charla). Cada charla queda escrita en
+`data/live-transcripts/`, un archivo de texto por sesión. La cancelación de eco es la del EMEET.
 La web corta la sesión a los 10 minutos o tras 2 minutos sin que nadie hable
 (`OPENAI_LIVE_MAX_MINUTES`, `OPENAI_LIVE_IDLE_MINUTES`).
 

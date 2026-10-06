@@ -69,3 +69,5 @@ next-env.d.ts
 /firmware/esp32/bins/
 /firmware/esp32/backups/
 /scripts/deploy-mini.env
+/data/live-transcripts/
+/data/live-codex/
