@@ -41,6 +41,7 @@ static bool s_wifi_ready = false;
 #define LED_BLINK_MS 350
 #define RECORDING_CHIME_SETTLE_MS 350
 #define STATUS_HEARTBEAT_MS 1000
+#define LISTEN_SKIP_AFTER_MS 800
 
 // Front panel: every EG STARTS button has a microswitch (COM to GND, NO to the
 // button GPIO, so a press reads LOW) and a lamp driven through a MOSFET or
@@ -282,6 +283,7 @@ static size_t s_remote_wav_size = 0;
 static char s_remote_message_id[96] = {0};
 static volatile bool s_remote_playing = false;
 static volatile bool s_remote_is_notification = false; // short "new message" voice cue
+static volatile TickType_t s_remote_started_at = 0;    // when the note on the speaker began
 static volatile bool s_remote_playback_finished = false;
 static volatile bool s_emeet_cycle_active = false;
 static volatile bool s_recording_indicator = false;
@@ -384,7 +386,15 @@ static void handle_listen_button(void)
     if (s_remote_playing && s_remote_is_notification) {
         // Pressing during the "new message" cue means "just play it".
         ESP_LOGI(TAG, "Listen button: cutting the voice cue short");
-    } else if (s_remote_playing || s_play_task_handle != NULL) {
+    } else if (s_remote_playing) {
+        // Pressing over a note skips to the next one. A second press right after
+        // the one that started it is a bounce or a double tap, not a skip.
+        if (xTaskGetTickCount() - s_remote_started_at < pdMS_TO_TICKS(LISTEN_SKIP_AFTER_MS)) {
+            ESP_LOGI(TAG, "Listen button ignored: the note has only just started");
+            return;
+        }
+        ESP_LOGI(TAG, "Listen button: skipping to the next message");
+    } else if (s_play_task_handle != NULL) {
         ESP_LOGW(TAG, "Listen button ignored: audio playback is active");
         return;
     } else if (s_emeet_cycle_active) {
@@ -1440,6 +1450,7 @@ static esp_err_t fetch_and_play_remote_message(void)
     s_remote_wav_size = total;
     strlcpy(s_remote_message_id, context.message_id, sizeof(s_remote_message_id));
     s_remote_is_notification = strncmp(s_remote_message_id, "notify_", 7) == 0;
+    s_remote_started_at = xTaskGetTickCount();
     s_remote_playing = true;
     player_config_t playback = {
         .pcm_ptr = pcm,
@@ -1762,6 +1773,7 @@ static bool play_prefetched_message(const char *id)
     s_prefetch.loaded[0] = '\0';
 
     s_remote_is_notification = false;
+    s_remote_started_at = xTaskGetTickCount();
     s_remote_playing = true;
     if (start_pcm_playback(&playback) != ESP_OK) {
         free(s_remote_wav_buf);
@@ -1805,10 +1817,10 @@ static void finish_remote_playback(void)
     ensure_mic_record_buffer();
 }
 
-// Stops the voice cue on the speaker so the requested note can start.
-static void stop_remote_cue(void)
+// Stops the cue or note on the speaker so the requested note can start.
+static void stop_remote_playback(void)
 {
-    if (!s_remote_playing || !s_remote_is_notification || s_play_task_handle == NULL) {
+    if (!s_remote_playing || s_play_task_handle == NULL) {
         return;
     }
     s_stop_play_request = true;
@@ -1968,7 +1980,7 @@ static void remote_messages_task(void *arg)
         }
         if (s_wifi_ready && s_listen_requested) {
             s_listen_requested = false;
-            stop_remote_cue();
+            stop_remote_playback();
             if (s_remote_playback_finished) {
                 finish_remote_playback(); // the cue must be acknowledged before the note plays
             }
