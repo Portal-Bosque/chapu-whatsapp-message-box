@@ -19,7 +19,7 @@ const SUMMARY_INSTRUCTIONS = `Te paso la transcripción de una charla entre Chap
 Escribí en español rioplatense, para que lo lean los padres:
 - title: un título de hasta ocho palabras que diga de qué se habló, sin punto final.
 - summary: un párrafo de dos a cuatro oraciones: quién habló si se sabe, qué hicieron o preguntaron y cómo siguió la charla.
-Contá solo lo que está en la transcripción. Las líneas "(búsqueda)" son datos que Chapu buscó en internet.
+Contá solo lo que está en la transcripción. Las líneas "(buscó en internet)" son búsquedas reales y las "(respuesta de Codex)" son lo que le pasaron a Chapu para decir.
 No uses herramientas: ni terminal, ni archivos, ni internet.`;
 
 const SUMMARY_SCHEMA = {

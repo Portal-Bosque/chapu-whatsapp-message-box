@@ -83,7 +83,7 @@ type Upstream = {
   close(): Promise<void>;
 };
 
-type Speaker = "child" | "chapu" | "lookup";
+type Speaker = "child" | "chapu" | "lookup" | "search";
 
 type UpstreamHandlers = {
   onStarted(): void;
@@ -242,7 +242,7 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
     handlers.onError("falta el módulo @roamhq/wrtc (npm install)");
     return null;
   }
-  const codex = codexAppServer();
+  const codex = codexAppServer(true); // one conversation at a time, so nothing else is using it
   const peer = new wrtc.RTCPeerConnection();
   const source = new wrtc.nonstandard.RTCAudioSource();
   const track = source.createTrack();
@@ -278,7 +278,9 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
     }
     // When the voice model asks for a fact, Codex runs a turn on this same thread
     // (with web search) and feeds the answer back by itself; the bridge only watches.
-    const item = params.item as { type?: string; text?: string; phase?: string } | undefined;
+    const item = params.item as { type?: string; text?: string; phase?: string; query?: string } | undefined;
+    // Written down so the transcript shows whether an answer really came from the web.
+    if (method === "item/completed" && item?.type === "webSearch") handlers.onTranscript("search", item.query || "(sin consulta)");
     if (method === "item/completed" && item?.type === "agentMessage" && item.phase === "final_answer" && item.text) {
       handlers.onTranscript("lookup", item.text);
     }
@@ -355,6 +357,9 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
       threadId,
       transport: { type: "webrtc", sdp: peer.localDescription?.sdp },
       outputModality: "audio",
+      // Codex's own startup context is about this computer and its user: useless
+      // to Chapu, and gathering it can hold the conversation back for half a minute.
+      includeStartupContext: false,
       version: "v3",
       voice: process.env.CODEX_LIVE_VOICE || "sol",
       model: process.env.CODEX_LIVE_MODEL || "gpt-live-1-codex",
@@ -407,7 +412,7 @@ function runSession(socket: net.Socket) {
   // The conversation as text, one file per session, written as it happens.
   const startedAt = new Date();
   const transcriptPath = path.join(transcriptsDirectory, `${startedAt.toISOString().replace(/[:.]/g, "-")}.txt`);
-  const SPEAKER_LABELS: Record<Speaker, string> = { child: "Chico", chapu: "Chapu", lookup: "(búsqueda)" };
+  const SPEAKER_LABELS: Record<Speaker, string> = { child: "Chico", chapu: "Chapu", lookup: "(respuesta de Codex)", search: "(buscó en internet)" };
   let transcriptStarted = false;
   let partial: { speaker: Speaker; text: string } | null = null;
   const writeLine = (speaker: Speaker, text: string) => {
