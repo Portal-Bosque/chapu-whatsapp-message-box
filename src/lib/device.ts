@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
@@ -32,7 +33,8 @@ export async function readDeviceHeartbeat(): Promise<DeviceHeartbeat | null> {
 export async function writeDeviceHeartbeat(heartbeat: DeviceHeartbeat) {
   await fs.mkdir(path.dirname(deviceStatusPath), { recursive: true });
   // Written every second: rename so a crash never leaves an empty file behind.
-  const temporaryPath = `${deviceStatusPath}.${process.pid}.tmp`;
+  // Unique per write: two heartbeats in flight used to share a name and fail the rename.
+  const temporaryPath = `${deviceStatusPath}.${process.pid}.${randomUUID()}.tmp`;
   await fs.writeFile(temporaryPath, JSON.stringify(heartbeat), "utf8");
   await fs.rename(temporaryPath, deviceStatusPath);
 }

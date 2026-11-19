@@ -3,7 +3,7 @@ import net from "node:net";
 
 import { createRequire } from "node:module";
 import path from "node:path";
-import { codexAppServer } from "@/lib/codex-app-server";
+import { CodexAppServer } from "@/lib/codex-app-server";
 import { appendEvent } from "@/lib/events";
 import { summarizeTranscript, transcriptsDirectory } from "@/lib/live-transcripts";
 
@@ -242,7 +242,8 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
     handlers.onError("falta el módulo @roamhq/wrtc (npm install)");
     return null;
   }
-  const codex = codexAppServer(true); // one conversation at a time, so nothing else is using it
+  const warm = takeWarmThread();
+  const codex = warm.codex;
   const peer = new wrtc.RTCPeerConnection();
   const source = new wrtc.nonstandard.RTCAudioSource();
   const track = source.createTrack();
@@ -253,7 +254,6 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
   let started = false;
   let ended = false;
   let pending: Buffer = Buffer.alloc(0);
-  const cwd = path.join(process.cwd(), "data", "live-codex"); // empty on purpose: Codex has nothing to read here
   let searches = 0;
 
   const end = () => {
@@ -263,6 +263,8 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
     sink?.stop();
     track.stop();
     peer.close();
+    codex.stop();
+    prepareWarmThread(); // ready for the next press
     handlers.onEnded();
   };
 
@@ -328,15 +330,7 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
   };
 
   void (async () => {
-    mkdirSync(cwd, { recursive: true });
-    await codex.ready;
-    const thread = await codex.request("thread/start", {
-      // The thread is the backend that answers lookups; the voice model gets its own prompt below.
-      ephemeral: true, sandbox: "read-only", approvalPolicy: "never", developerInstructions: LOOKUP_INSTRUCTIONS, cwd,
-      config: { web_search: "live" },
-      ...(process.env.CODEX_LOOKUP_MODEL ? { model: process.env.CODEX_LOOKUP_MODEL } : {}),
-    }) as { thread: { id: string } };
-    threadId = thread.thread.id;
+    threadId = await warm.threadId;
     await peer.setLocalDescription(await peer.createOffer({ offerToReceiveAudio: true }));
     // OpenAI answers with its own candidates, so a complete local gather is not required.
     await new Promise<void>((resolve) => {
@@ -395,6 +389,55 @@ function codexUpstream(handlers: UpstreamHandlers): Upstream | null {
   };
 }
 
+// Starting an app-server and a thread takes from half a second to twenty, all of
+// it with the child waiting in silence after pressing the button. So one is
+// started ahead of time and handed to the next conversation. It is replaced every
+// few minutes and after each conversation: an app-server left running for weeks
+// got slow and stopped hearing the microphone (2026-11-19), and a Codex upgrade
+// would leave an old one without its helpers.
+type WarmThread = { codex: CodexAppServer; threadId: Promise<string>; failed: boolean };
+const WARM_REFRESH_MS = 10 * 60_000;
+const warmState = globalThis as typeof globalThis & { chapuWarmThread?: WarmThread; chapuWarmTimer?: NodeJS.Timeout };
+
+function startThread(): WarmThread {
+  const codex = new CodexAppServer();
+  const cwd = path.join(process.cwd(), "data", "live-codex"); // empty on purpose: Codex has nothing to read here
+  const warm: WarmThread = { codex, failed: false, threadId: Promise.resolve("") };
+  warm.threadId = (async () => {
+    mkdirSync(cwd, { recursive: true });
+    await codex.ready;
+    const thread = await codex.request("thread/start", {
+      // The thread is the backend that answers lookups; the voice model gets its own prompt in thread/realtime/start.
+      ephemeral: true, sandbox: "read-only", approvalPolicy: "never", developerInstructions: LOOKUP_INSTRUCTIONS, cwd,
+      config: { web_search: "live" },
+      ...(process.env.CODEX_LOOKUP_MODEL ? { model: process.env.CODEX_LOOKUP_MODEL } : {}),
+    }) as { thread: { id: string } };
+    return thread.thread.id;
+  })();
+  warm.threadId.catch(() => {
+    warm.failed = true;
+  });
+  return warm;
+}
+
+function prepareWarmThread() {
+  if ((process.env.LIVE_PROVIDER || "codex") === "openai") return;
+  clearTimeout(warmState.chapuWarmTimer);
+  warmState.chapuWarmThread?.codex.stop();
+  warmState.chapuWarmThread = startThread();
+  warmState.chapuWarmTimer = setTimeout(prepareWarmThread, WARM_REFRESH_MS);
+  warmState.chapuWarmTimer.unref();
+}
+
+function takeWarmThread() {
+  const warm = warmState.chapuWarmThread;
+  warmState.chapuWarmThread = undefined;
+  clearTimeout(warmState.chapuWarmTimer);
+  if (warm && warm.codex.alive && !warm.failed) return warm;
+  warm?.codex.stop();
+  return startThread();
+}
+
 // ---------- one conversation with the box ----------
 
 function runSession(socket: net.Socket) {
@@ -406,6 +449,8 @@ function runSession(socket: net.Socket) {
   let finished = false;
   let closeReason = "se cortó la conexión con el modelo";
   let usageSeconds: number | null = null;
+  let micBytes = 0;
+  let childLines = 0;
   let lastSpeechAt = Date.now();
   const timers: NodeJS.Timeout[] = [];
 
@@ -444,7 +489,9 @@ function runSession(socket: net.Socket) {
     if (activeSession === close) activeSession = null;
     if (transcriptStarted) void summarizeTranscript(path.basename(transcriptPath, ".txt"));
     const duration = usageSeconds === null ? "" : ` (${usageSeconds} s)`;
-    void appendEvent("device", `Modo charla terminado: ${reason}${duration}`);
+    // Tells "the box sent no audio" apart from "the model did not hear it".
+    const heard = ` · ${Math.round(micBytes / (SAMPLE_RATE * 2))} s de micrófono, ${childLines} frases de los chicos`;
+    void appendEvent("device", `Modo charla terminado: ${reason}${duration}${heard}`);
   };
 
   // Let the provider finalize so the used time is known, then drop everything.
@@ -476,6 +523,7 @@ function runSession(socket: net.Socket) {
       lastSpeechAt = Date.now();
     },
     onTranscript(speaker, text, isPartial) {
+      if (speaker === "child" && !isPartial) childLines++;
       if (isPartial && partial?.speaker === speaker) {
         partial.text += text;
         return;
@@ -509,7 +557,10 @@ function runSession(socket: net.Socket) {
   }
   socket.on("data", (chunk: Buffer) => {
     dump?.write(chunk);
-    if (started) upstream.sendAudio(chunk);
+    if (started) {
+      micBytes += chunk.length;
+      upstream.sendAudio(chunk);
+    }
   });
   // The box simply drops the socket, which can surface as a reset.
   socket.on("error", () => close("terminó desde la caja"));
@@ -557,4 +608,5 @@ export function startLiveBridge() {
   });
   server.listen(port, "0.0.0.0");
   state.chapuLiveBridge = server;
+  prepareWarmThread();
 }

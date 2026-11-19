@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
@@ -19,7 +20,7 @@ export class CodexAppServer {
 
   constructor() {
     this.child = spawn(process.env.CODEX_BIN || "codex",
-      ["app-server", "--listen", "stdio://", "-c", "features.realtime_conversation=true", "-c", "suppress_unstable_features_warning=true"],
+      ["app-server", "--listen", "stdio://", "-c", "features.realtime_conversation=true", "-c", "suppress_unstable_features_warning=true", ...leanFlags()],
       { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PATH: SEARCH_PATH } });
     this.child.stderr.resume();
     this.child.on("error", () => this.died());
@@ -81,6 +82,22 @@ export class CodexAppServer {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
+}
+
+// The Codex login on this Mac also has plugins (Gmail, documents, a browser…) and
+// MCP servers configured for the person who uses it. Chapu needs none of them, and
+// loading them on every new thread made live mode take twice as long to start.
+function leanFlags() {
+  const flags = ["-c", "features.plugins=false"];
+  try {
+    const home = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+    const config = readFileSync(path.join(home, "config.toml"), "utf8");
+    const servers = new Set([...config.matchAll(/^\[mcp_servers\.("[^"]+"|[\w-]+)\]/gm)].map((match) => match[1]));
+    servers.forEach((server) => flags.push("-c", `mcp_servers.${server}.enabled=false`));
+  } catch {
+    // No config: nothing to turn off.
+  }
+  return flags;
 }
 
 const SEARCH_PATH = `${process.env.PATH ?? ""}:/opt/homebrew/bin:/usr/local/bin`;
