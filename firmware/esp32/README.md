@@ -67,7 +67,7 @@ por minuto (voz en `OPENAI_LIVE_VOICE`). Por la suscripción Chapu también pued
 modelo de voz pide un dato, Codex lo resuelve en el mismo hilo con búsqueda web
 (hasta 3 búsquedas por charla). Cada charla queda escrita en
 `data/live-transcripts/`, un archivo de texto por sesión. La cancelación de eco es la del EMEET.
-La web corta la sesión a los 10 minutos o tras 2 minutos sin que nadie hable
+La charla sigue mientras los chicos hablen: la web la corta tras 2 minutos sin que nadie hable o, como tope, a los 30 minutos
 (`OPENAI_LIVE_MAX_MINUTES`, `OPENAI_LIVE_IDLE_MINUTES`).
 
 Para probar sin el botón: `POST /api/device/live` con `{"action":"start"}` o

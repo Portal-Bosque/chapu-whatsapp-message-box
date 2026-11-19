@@ -441,7 +441,10 @@ function takeWarmThread() {
 // ---------- one conversation with the box ----------
 
 function runSession(socket: net.Socket) {
-  const maxMs = minutesFromEnv("OPENAI_LIVE_MAX_MINUTES", 10) * 60_000;
+  // A conversation goes on while the children keep talking (the idle limit ends it
+  // otherwise); this cap only guards the subscription from a session left running.
+  // It was 10 minutes, which cut kids off mid-game while they asked for more.
+  const maxMs = minutesFromEnv("OPENAI_LIVE_MAX_MINUTES", 30) * 60_000;
   const idleMs = minutesFromEnv("OPENAI_LIVE_IDLE_MINUTES", 2) * 60_000;
   const viaCodex = (process.env.LIVE_PROVIDER || "codex") !== "openai";
   let started = false;
@@ -450,6 +453,8 @@ function runSession(socket: net.Socket) {
   let closeReason = "se cortó la conexión con el modelo";
   let usageSeconds: number | null = null;
   let micBytes = 0;
+  let micPeak = 0;
+  let micSquares = 0;
   let childLines = 0;
   let lastSpeechAt = Date.now();
   const timers: NodeJS.Timeout[] = [];
@@ -490,7 +495,10 @@ function runSession(socket: net.Socket) {
     if (transcriptStarted) void summarizeTranscript(path.basename(transcriptPath, ".txt"));
     const duration = usageSeconds === null ? "" : ` (${usageSeconds} s)`;
     // Tells "the box sent no audio" apart from "the model did not hear it".
-    const heard = ` · ${Math.round(micBytes / (SAMPLE_RATE * 2))} s de micrófono, ${childLines} frases de los chicos`;
+    // Levels are in percent of full scale; speech near the box peaks well above 10 %.
+    const rms = micBytes ? Math.round(Math.sqrt(micSquares / (micBytes / 2)) / 327.68 * 10) / 10 : 0;
+    const peak = Math.round(micPeak / 327.68);
+    const heard = ` · ${Math.round(micBytes / (SAMPLE_RATE * 2))} s de micrófono (pico ${peak} %, promedio ${rms} %), ${childLines} frases de los chicos`;
     void appendEvent("device", `Modo charla terminado: ${reason}${duration}${heard}`);
   };
 
@@ -559,6 +567,11 @@ function runSession(socket: net.Socket) {
     dump?.write(chunk);
     if (started) {
       micBytes += chunk.length;
+      for (let i = 0; i + 1 < chunk.length; i += 2) {
+        const sample = chunk.readInt16LE(i);
+        micPeak = Math.max(micPeak, Math.abs(sample));
+        micSquares += sample * sample;
+      }
       upstream.sendAudio(chunk);
     }
   });
