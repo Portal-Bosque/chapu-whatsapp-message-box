@@ -100,7 +100,9 @@ en el archivo local de secretos del firmware.
 
 ## API principal
 
-- `POST /api/recordings`: recibe audio WAV del ESP32.
+- `POST /api/recordings`: recibe audio WAV del ESP32. El header `X-Selected-Slot`
+  indica el botón de agenda que estaba encendido al empezar a grabar; el audio
+  va a ese contacto aunque la selección de la web haya cambiado mientras tanto.
 - `GET /api/recordings`: lista las grabaciones locales.
 - `GET /api/recordings/:id`: entrega audio con soporte de Range.
 - `GET /api/outbox`: administra la cola destinada al EMEET.

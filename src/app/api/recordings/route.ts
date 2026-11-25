@@ -4,13 +4,34 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { analyzeAudioQuality } from "@/lib/audio-quality";
 import { ensureRecordingsDirectory, isWave, readLatestAudioResult, recordingsDirectory, wavDurationMs, writeLatestAudioResult } from "@/lib/recordings";
-import { getSelectedRecipient } from "@/lib/settings";
+import { AGENDA_SLOTS, getSelectedRecipient, readSettings, selectRecipient } from "@/lib/settings";
 import { sendVoiceMessage } from "@/lib/wacli";
 import { appendEvent } from "@/lib/events";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 const MAX_RECORDING_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Who the note goes to. The ESP32 names the agenda slot its lamp showed when
+ * recording started (X-Selected-Slot); that wins over the web's selection,
+ * which can lag behind a button press (the heartbeat carrying it may still be
+ * waiting behind a download) or be moved by a note that arrives mid-recording.
+ */
+async function recipientForUpload(request: Request) {
+  const header = request.headers.get("x-selected-slot");
+  const slot = header === null || header.trim() === "" ? Number.NaN : Number(header);
+  const selected = await getSelectedRecipient();
+  if (!Number.isInteger(slot) || slot < 0 || slot >= AGENDA_SLOTS) return selected;
+  const settings = await readSettings();
+  const pressed = settings.recipients[slot];
+  if (!pressed) return selected;
+  if (pressed.id !== selected?.id) {
+    await appendEvent("device", `La caja grabó para ${pressed.label} (botón ${slot + 1}) pero la web tenía elegido a ${selected?.label ?? "nadie"}; se manda a ${pressed.label}`);
+    await selectRecipient(pressed.id).catch(() => undefined);
+  }
+  return pressed;
+}
 
 export async function POST(request: Request) {
   const contentLength = Number(request.headers.get("content-length") ?? 0);
@@ -64,7 +85,7 @@ export async function POST(request: Request) {
   await ensureRecordingsDirectory();
   const filePath = path.join(recordingsDirectory, `${id}.wav`);
   const metadataPath = path.join(recordingsDirectory, `${id}.json`);
-  const recipient = await getSelectedRecipient();
+  const recipient = await recipientForUpload(request);
   const metadata = {
     source: "emeet",
     recipient,
