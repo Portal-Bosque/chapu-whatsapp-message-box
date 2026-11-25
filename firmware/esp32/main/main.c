@@ -90,9 +90,6 @@ typedef enum {
 // State mirrored from the web application through the heartbeat response.
 static volatile int s_selected_slot = -1;        // agenda slot the web will send to
 static volatile int s_pending_slot_press = -1;   // agenda press not yet confirmed by the web
-// Slot the lamp showed when the current recording started; sent with the upload
-// so the note goes to that contact even if the web's selection lags or moves.
-static volatile int s_recording_slot = -1;
 static volatile bool s_slot_configured[AGENDA_SLOTS] = {false};
 static volatile int s_queued_messages = 0;       // WhatsApp notes waiting for the listen button
 static volatile bool s_listen_requested = false;
@@ -1132,7 +1129,6 @@ static void prepare_recording_chimes(void)
 
 static void start_recording_cycle(void)
 {
-    s_recording_slot = s_selected_slot;
     if (s_spk_dev_handle == NULL || s_mic_dev_handle == NULL || s_start_chime_pcm == NULL || s_play_task_handle != NULL) {
         ESP_LOGW(TAG, "Could not start recording: audio device is busy or unavailable");
         s_recording_indicator = false;
@@ -2119,12 +2115,6 @@ static esp_err_t upload_captured_recording(void)
 
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
     esp_http_client_set_header(client, "X-Device-ID", "message-box-esp32");
-    const int recording_slot = s_recording_slot;
-    char slot_header[8];
-    if (recording_slot >= 0 && recording_slot < AGENDA_SLOTS) {
-        snprintf(slot_header, sizeof(slot_header), "%d", recording_slot);
-        esp_http_client_set_header(client, "X-Selected-Slot", slot_header);
-    }
     size_t request_size = sizeof(header) + recorded_size;
     esp_err_t result = esp_http_client_open(client, request_size);
     if (result == ESP_OK) {
