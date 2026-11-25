@@ -7,10 +7,12 @@ import { ensureRecordingsDirectory, isWave, readLatestAudioResult, recordingsDir
 import { AGENDA_SLOTS, getSelectedRecipient, readSettings, selectRecipient } from "@/lib/settings";
 import { sendVoiceMessage } from "@/lib/wacli";
 import { appendEvent } from "@/lib/events";
+import { waitForHeartbeatAfter } from "@/lib/device";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 const MAX_RECORDING_BYTES = 10 * 1024 * 1024;
+const HEARTBEAT_WAIT_MS = 30_000;
 
 /**
  * Who the note goes to. The ESP32 names the agenda slot its lamp showed when
@@ -18,11 +20,19 @@ const MAX_RECORDING_BYTES = 10 * 1024 * 1024;
  * which can lag behind a button press (the heartbeat carrying it may still be
  * waiting behind a download) or be moved by a note that arrives mid-recording.
  */
-async function recipientForUpload(request: Request) {
+async function recipientForUpload(request: Request, uploadStartedAt: number) {
   const header = request.headers.get("x-selected-slot");
   const slot = header === null || header.trim() === "" ? Number.NaN : Number(header);
+  if (!Number.isInteger(slot) || slot < 0 || slot >= AGENDA_SLOTS) {
+    // Firmware that does not name the slot: a press made before recording may
+    // still be queued in a heartbeat stuck behind a download. Wait for the
+    // ESP32's next heartbeat (normally under a second) so it counts.
+    if (!(await waitForHeartbeatAfter(uploadStartedAt, HEARTBEAT_WAIT_MS))) {
+      await appendEvent("device", "El ESP32 no mandó su estado a tiempo; el audio va al contacto elegido en la web");
+    }
+    return getSelectedRecipient();
+  }
   const selected = await getSelectedRecipient();
-  if (!Number.isInteger(slot) || slot < 0 || slot >= AGENDA_SLOTS) return selected;
   const settings = await readSettings();
   const pressed = settings.recipients[slot];
   if (!pressed) return selected;
@@ -34,6 +44,7 @@ async function recipientForUpload(request: Request) {
 }
 
 export async function POST(request: Request) {
+  const uploadStartedAt = Date.now();
   const contentLength = Number(request.headers.get("content-length") ?? 0);
   if (contentLength > MAX_RECORDING_BYTES) {
     return NextResponse.json({ error: "Recording is too large" }, { status: 413 });
@@ -85,7 +96,7 @@ export async function POST(request: Request) {
   await ensureRecordingsDirectory();
   const filePath = path.join(recordingsDirectory, `${id}.wav`);
   const metadataPath = path.join(recordingsDirectory, `${id}.json`);
-  const recipient = await recipientForUpload(request);
+  const recipient = await recipientForUpload(request, uploadStartedAt);
   const metadata = {
     source: "emeet",
     recipient,

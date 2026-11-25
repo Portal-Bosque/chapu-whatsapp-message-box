@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { DEVICE_ONLINE_WINDOW_MS, heartbeatAgeMs, readDeviceHeartbeat, writeDeviceHeartbeat, type DeviceHeartbeat } from "@/lib/device";
+import { DEVICE_ONLINE_WINDOW_MS, heartbeatAgeMs, markHeartbeatApplied, readDeviceHeartbeat, writeDeviceHeartbeat, type DeviceHeartbeat } from "@/lib/device";
 import { appendEvent } from "@/lib/events";
 import { takeLiveCommand } from "@/lib/live-bridge";
 import { slotNameVersions } from "@/lib/names";
@@ -81,6 +81,8 @@ export async function POST(request: Request) {
     }
   }
 
+  // Only now is any press in this heartbeat reflected in the selection.
+  markHeartbeatApplied();
   return NextResponse.json({ received: true, ...(await panelState(body.localRoulette !== true)) }, { headers: { "Cache-Control": "no-store" } });
 }
 

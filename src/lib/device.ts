@@ -48,3 +48,22 @@ export function heartbeatAgeMs(heartbeat: DeviceHeartbeat | null) {
 export async function isDeviceOnline() {
   return heartbeatAgeMs(await readDeviceHeartbeat()) <= DEVICE_ONLINE_WINDOW_MS;
 }
+
+// When the last heartbeat finished applying its button press. The heartbeat
+// runs in the same ESP32 task as note downloads, so a press can reach the web
+// seconds after the recording it was meant for; uploads wait for it.
+const heartbeatRuntime = globalThis as typeof globalThis & { __messageBoxHeartbeatDoneAt?: number };
+
+export function markHeartbeatApplied() {
+  heartbeatRuntime.__messageBoxHeartbeatDoneAt = Date.now();
+}
+
+/** Waits until a heartbeat that started after `since` has been fully applied. */
+export async function waitForHeartbeatAfter(since: number, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while ((heartbeatRuntime.__messageBoxHeartbeatDoneAt ?? 0) <= since) {
+    if (Date.now() >= deadline || !(await isDeviceOnline())) return false;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return true;
+}
