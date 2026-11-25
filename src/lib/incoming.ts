@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { isDeviceOnline, readDeviceHeartbeat } from "@/lib/device";
 import { appendEvent } from "@/lib/events";
 import { readSettings, selectRecipient } from "@/lib/settings";
 
@@ -28,13 +29,19 @@ export async function readIncomingMarker(outboxId: string): Promise<IncomingMark
 
 /**
  * Points the agenda at the sender of a note so the send button answers it.
- * Returns true when the selection changed; unknown numbers leave it alone.
+ * Returns true when the selection changed; unknown numbers leave it alone, and
+ * so does a recording in progress: the note being recorded belongs to the
+ * contact that was chosen when it started, not to whoever just wrote.
  */
 export async function selectSenderRecipient(senderId: string | null | undefined, reason: string) {
   if (!senderId) return false;
   const settings = await readSettings();
   const recipient = settings.recipients.find((item) => item.id === senderId);
   if (!recipient || recipient.id === settings.selectedRecipientId) return false;
+  if (await isDeviceOnline() && (await readDeviceHeartbeat())?.recording) {
+    await appendEvent("device", `${reason}: la caja está grabando, la agenda sigue en el contacto elegido`);
+    return false;
+  }
   await selectRecipient(recipient.id);
   await appendEvent("device", `${reason}: ahora se habla con ${recipient.label}`);
   return true;
